@@ -28,12 +28,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux (manylinux_2_28 + 可选 musllinux), x86_64
           - os: ubuntu-latest
             cibw_arch: x86_64
-          # Linux (manylinux_2_28 + 可选 musllinux), aarch64 (QEMU)
-          - os: ubuntu-latest
-            cibw_arch: aarch64
+          - os: macos-latest
+            cibw_arch: arm64
           # macOS universal2（单轮子同时覆盖 x86_64 + arm64）
           - os: macos-latest
             cibw_arch: universal2
@@ -42,21 +40,13 @@ jobs:
             cibw_arch: AMD64
 
     env:
-      # abi3：每平台仅构一次（最低 3.10）
       CIBW_BUILD: "cp310-*"
-      # 如不需要 musllinux，可追加 *-musllinux* 跳过
       CIBW_SKIP: "*-win32 *-manylinux_i686"
-
-      # 目标架构
       CIBW_ARCHS_LINUX: ${{ matrix.cibw_arch }}
       CIBW_ARCHS_MACOS: ${{ matrix.cibw_arch }}
       CIBW_ARCHS_WINDOWS: ${{ matrix.cibw_arch }}
-
-      # Linux 使用 manylinux_2_28
       CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
       CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_28
-
-      # 在 Linux 容器（manylinux/musllinux）内部安装 Rust
       CIBW_BEFORE_ALL_LINUX: >
         /bin/sh -exc '
           if command -v apk >/dev/null 2>&1; then
@@ -69,18 +59,13 @@ jobs:
           curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
         '
       CIBW_ENVIRONMENT_LINUX: "PATH=$HOME/.cargo/bin:$PATH"
-
-      # macOS universal2 更稳的最低系统版本
       CIBW_ENVIRONMENT_MACOS: "MACOSX_DEPLOYMENT_TARGET=11.0"
-
-      # 冒烟测试：导入模块并输出版本
       CIBW_TEST_COMMAND: >
         python -c "import word2vec_matryoshka as m; print(getattr(m, '__version__', 'ok'))"
 
     steps:
       - uses: actions/checkout@v4
 
-      # 主机侧安装 Rust；macOS universal2 需要双目标
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -107,7 +92,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.10"
 
       - name: Build sdist
         run: |

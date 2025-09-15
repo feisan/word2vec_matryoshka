@@ -31,7 +31,7 @@ jobs:
       # 可选：manylinux 基线
       # CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
       # CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_28
-      CIBW_TEST_COMMAND: "python -c \"import your_package; print(getattr(your_package, '__version__', 'ok'))\""
+      CIBW_TEST_COMMAND: "python -c \"import word2vec_matryoshka; print(getattr(word2vec_matryoshka, '__version__', 'ok'))\""
 
     steps:
       - uses: actions/checkout@v4

@@ -13,14 +13,12 @@ jobs:
         include:
           - os: ubuntu-latest
             cibw_arch: x86_64
-          - os: ubuntu-latest
-            cibw_arch: aarch64
           - os: macos-13
             cibw_arch: x86_64
           - os: macos-latest
             cibw_arch: arm64
           - os: windows-latest
-            cibw_arch: amd64
+            cibw_arch: AMD64
 
     env:
       CIBW_BUILD: "cp310-*"

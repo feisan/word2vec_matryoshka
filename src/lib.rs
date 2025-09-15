@@ -20,11 +20,10 @@
     clippy::too_many_arguments
 )]
 use ahash::AHashMap as HashMap;
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
 use once_cell::sync::Lazy;
-use pyo3::exceptions::{PyKeyError, PyValueError};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyIterator, PyModule, PySlice, PyType};
+use pyo3::types::{PyAny, PyIterator, PyModule, PyType};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -42,65 +41,23 @@ mod ops;
 mod sampling;
 mod training;
 mod weights;
+mod kv;
+mod logutil;
 use io::npy::{npy_header_len, read_npy_shape, write_npy};
 // cosine_prefix used only in earlier versions; current codepaths inline cosine
 use weights::SharedWeights;
+// Re-export KeyedVectors and logging helper from split modules
+use kv::KeyedVectors;
+use logutil::log_info_msg;
 
 static BASE_SEED: AtomicU64 = AtomicU64::new(42);
 static GLOBAL_RNG: Lazy<Mutex<StdRng>> =
     Lazy::new(|| Mutex::new(StdRng::seed_from_u64(BASE_SEED.load(Ordering::Relaxed))));
 static RNG_COUNTER: AtomicU64 = AtomicU64::new(1);
-static LOGGING_READY: AtomicBool = AtomicBool::new(false);
 // Versioning to re-seed per-thread RNGs when `set_seed` is called.
 static SEED_EPOCH: AtomicU64 = AtomicU64::new(1);
 thread_local! {
     static TLS_RNG: RefCell<(u64, Option<StdRng>)> = const { RefCell::new((0, None)) };
-}
-
-fn log_info_msg(msg: &str) {
-    Python::with_gil(|py| {
-        if let Ok(logging) = PyModule::import_bound(py, "logging") {
-            if !LOGGING_READY.swap(true, Ordering::Relaxed) {
-                if let Ok(logger0) = logging
-                    .getattr("getLogger")
-                    .and_then(|f| f.call1(("word2vec_matryoshka",)))
-                {
-                    if let Ok(handlers) = logger0.getattr("handlers") {
-                        let len: usize = handlers
-                            .getattr("__len__")
-                            .and_then(|l| l.call0())
-                            .and_then(|v| v.extract())
-                            .unwrap_or(0);
-                        if len == 0 {
-                            if let (Ok(sh), Ok(fmtmod)) = (
-                                logging.getattr("StreamHandler").and_then(|c| c.call0()),
-                                logging.getattr("Formatter"),
-                            ) {
-                                if let Ok(fmt) = fmtmod.call1((
-                                    "%(asctime)s: %(levelname)s: %(message)s",
-                                    "%Y-%m-%d %H:%M:%S",
-                                )) {
-                                    let _ = sh.call_method1("setFormatter", (fmt,));
-                                }
-                                let _ = logger0.call_method1("addHandler", (sh,));
-                                if let Ok(info) = logging.getattr("INFO") {
-                                    let _ = logger0.call_method1("setLevel", (info,));
-                                }
-                                // allow propagation so external handlers (e.g., pytest caplog) can capture
-                                let _ = logger0.setattr("propagate", true);
-                            }
-                        }
-                    }
-                }
-            }
-            if let Ok(logger) = logging
-                .getattr("getLogger")
-                .and_then(|f| f.call1(("word2vec_matryoshka",)))
-            {
-                let _ = logger.call_method1("info", (msg.to_string(),));
-            }
-        }
-    });
 }
 
 // SharedWeights moved to weights module
@@ -111,334 +68,6 @@ struct KVSerde {
     vector_size: usize,
 }
 
-#[pyclass(module = "word2vec_matryoshka")]
-#[derive(Default)]
-struct KeyedVectors {
-    vectors: Option<HashMap<String, Vec<f32>>>,
-    vector_size: usize,
-    vocab: Vec<String>,
-    index: HashMap<String, usize>,
-    npy_path: Option<String>,
-    memmap: Option<Py<PyAny>>,
-}
-
-#[pymethods]
-impl KeyedVectors {
-    #[new]
-    fn new() -> Self {
-        Self {
-            vectors: Some(HashMap::new()),
-            vector_size: 0,
-            vocab: Vec::new(),
-            index: HashMap::default(),
-            npy_path: None,
-            memmap: None,
-        }
-    }
-
-    #[staticmethod]
-    #[pyo3(signature = (path, mmap=None))]
-    fn load(path: &str, mmap: Option<&str>) -> PyResult<Self> {
-        let base = path;
-        let vocab_path = format!("{}.vocab.json", base);
-        let npy_path = format!("{}.npy", base);
-
-        let vocab_text = fs::read_to_string(&vocab_path)
-            .map_err(|e| PyValueError::new_err(format!("failed to read {}: {}", vocab_path, e)))?;
-        let vocab: Vec<String> = serde_json::from_str(&vocab_text)
-            .map_err(|e| PyValueError::new_err(format!("failed to parse vocab json: {}", e)))?;
-        let mut index: HashMap<String, usize> = HashMap::default();
-        for (i, w) in vocab.iter().enumerate() {
-            index.insert(w.clone(), i);
-        }
-
-        let (_rows, cols) = read_npy_shape(&npy_path)?;
-
-        if mmap == Some("r") {
-            let memmap = Python::with_gil(|py| -> PyResult<Py<PyAny>> {
-                let np = PyModule::import_bound(py, "numpy")?;
-                let kwargs = PyDict::new_bound(py);
-                kwargs.set_item("mmap_mode", "r")?;
-                let arr = np
-                    .getattr("load")?
-                    .call((npy_path.as_str(),), Some(&kwargs))?;
-                Ok(arr.into_py(py))
-            })?;
-            Ok(Self {
-                vectors: None,
-                vector_size: cols,
-                vocab,
-                index,
-                npy_path: Some(npy_path),
-                memmap: Some(memmap),
-            })
-        } else {
-            let buf = fs::read(&npy_path).map_err(|e| {
-                PyValueError::new_err(format!("failed to read {}: {}", npy_path, e))
-            })?;
-            let header_len = npy_header_len(&buf)?;
-            let data_bytes = &buf[header_len..];
-            let rows = vocab.len();
-            let mut vectors: HashMap<String, Vec<f32>> = HashMap::default();
-            let mut offset = 0usize;
-            for i in 0..rows {
-                let mut row = vec![0f32; cols];
-                let bytes = &data_bytes[offset..offset + cols * 4];
-                for j in 0..cols {
-                    let start = j * 4;
-                    row[j] = f32::from_le_bytes(bytes[start..start + 4].try_into().unwrap());
-                }
-                vectors.insert(vocab[i].clone(), row);
-                offset += cols * 4;
-            }
-            Ok(Self {
-                vectors: Some(vectors),
-                vector_size: cols,
-                vocab,
-                index,
-                npy_path: None,
-                memmap: None,
-            })
-        }
-    }
-
-    fn save(&self, path: &str) -> PyResult<()> {
-        let base = path;
-        let vocab_path = format!("{}.vocab.json", base);
-        let npy_path = format!("{}.npy", base);
-        if let Some(map) = &self.vectors {
-            // Preserve existing vocab order if available, fall back to map iteration
-            let words: Vec<String> = if !self.vocab.is_empty() {
-                self.vocab.clone()
-            } else {
-                map.keys().cloned().collect()
-            };
-            let cols = self.vector_size;
-            // Atomic temp files
-            let vocab_tmp = format!("{}.tmp", &vocab_path);
-            let npy_tmp = format!("{}.tmp", &npy_path);
-            fs::write(&vocab_tmp, serde_json::to_string(&words).unwrap()).map_err(|e| {
-                PyValueError::new_err(format!("failed to write {}: {}", vocab_tmp, e))
-            })?;
-            let mut flat: Vec<f32> = Vec::with_capacity(words.len() * cols);
-            for w in &words {
-                let v = map
-                    .get(w)
-                    .ok_or_else(|| PyValueError::new_err("missing vector"))?;
-                if v.len() != cols {
-                    return Err(PyValueError::new_err("inconsistent vector size"));
-                }
-                flat.extend_from_slice(v);
-            }
-            write_npy(&npy_tmp, words.len(), cols, &flat)?;
-            fs::rename(&vocab_tmp, &vocab_path).map_err(|e| {
-                PyValueError::new_err(format!("failed to finalize {}: {}", vocab_path, e))
-            })?;
-            fs::rename(&npy_tmp, &npy_path).map_err(|e| {
-                PyValueError::new_err(format!("failed to finalize {}: {}", npy_path, e))
-            })?;
-            Ok(())
-        } else if let Some(src) = &self.npy_path {
-            // Atomic temp files
-            let vocab_tmp = format!("{}.tmp", &vocab_path);
-            let npy_tmp = format!("{}.tmp", &npy_path);
-            fs::write(&vocab_tmp, serde_json::to_string(&self.vocab).unwrap()).map_err(|e| {
-                PyValueError::new_err(format!("failed to write {}: {}", vocab_tmp, e))
-            })?;
-            fs::copy(src, &npy_tmp)
-                .map_err(|e| PyValueError::new_err(format!("failed to copy npy: {}", e)))?;
-            fs::rename(&vocab_tmp, &vocab_path).map_err(|e| {
-                PyValueError::new_err(format!("failed to finalize {}: {}", vocab_path, e))
-            })?;
-            fs::rename(&npy_tmp, &npy_path).map_err(|e| {
-                PyValueError::new_err(format!("failed to finalize {}: {}", npy_path, e))
-            })?;
-            Ok(())
-        } else {
-            Err(PyValueError::new_err("no vectors to save"))
-        }
-    }
-
-    #[pyo3(signature = (word, topn=None, level=None))]
-    fn most_similar<'py>(
-        &self,
-        py: Python<'py>,
-        word: &str,
-        topn: Option<usize>,
-        level: Option<usize>,
-    ) -> PyResult<Vec<(String, f32)>> {
-        let topn = topn.unwrap_or(10);
-        let use_dim = level.unwrap_or(self.vector_size).min(self.vector_size);
-        if use_dim == 0 || topn == 0 {
-            return Ok(Vec::new());
-        }
-        // In-memory fast path
-        if let Some(map) = &self.vectors {
-            let v = map
-                .get(word)
-                .ok_or_else(|| PyKeyError::new_err(format!("word '{}' not in vocab", word)))?;
-            let v_slice = &v[..use_dim];
-            // Precompute norm of the query once
-            let mut na = 0.0f32;
-            for i in 0..use_dim { na += v_slice[i] * v_slice[i]; }
-            let na_sqrt = if na > 0.0 { na.sqrt() } else { 0.0 };
-            let n = self.vocab.len();
-            let k = topn.min(n.saturating_sub(1));
-            let mut heap: Vec<(String, f32)> = Vec::with_capacity(k);
-            for (w, u) in map.iter() {
-                if w == word {
-                    continue;
-                }
-                // Compute cosine using cached query norm
-                let mut dot = 0.0f32; let mut nb = 0.0f32;
-                for i in 0..use_dim {
-                    let a = v_slice[i];
-                    let b = u[i];
-                    dot += a * b; nb += b * b;
-                }
-                let sim = if na_sqrt == 0.0 || nb == 0.0 { 0.0 } else { dot / (na_sqrt * nb.sqrt()) };
-                if heap.len() < k {
-                    heap.push((w.clone(), sim));
-                } else if let Some(pos) = heap
-                    .iter()
-                    .enumerate()
-                    .min_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap())
-                    .map(|p| p.0)
-                {
-                    if sim > heap[pos].1 {
-                        heap[pos] = (w.clone(), sim);
-                    }
-                }
-            }
-            heap.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            return Ok(heap);
-        }
-        // Memmap-backed path: copy each row prefix into Rust slices and compute on the fly
-        let idx = *self
-            .index
-            .get(word)
-            .ok_or_else(|| PyKeyError::new_err(format!("word '{}' not in vocab", word)))?;
-        let memmap = self
-            .memmap
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("memmap not initialized"))?;
-        let mm = memmap.bind(py);
-        // Use raw element pointers (uget_raw) to avoid ndarray alignment constraints
-        let arr: Bound<PyArray2<f32>> = mm.clone().downcast_into()?;
-        let shape = arr.shape();
-        let rows = shape[0];
-        let cols = shape[1];
-        let dim = use_dim.min(cols);
-        let vptr = unsafe { arr.uget_raw([idx, 0]) as *const f32 };
-        let mut v_slice: Vec<f32> = vec![0.0; dim];
-        for i in 0..dim { v_slice[i] = unsafe { std::ptr::read_unaligned(vptr.add(i)) }; }
-        // Precompute query norm once
-        let mut na = 0.0f32;
-        for i in 0..dim { na += v_slice[i] * v_slice[i]; }
-        let na_sqrt = if na > 0.0 { na.sqrt() } else { 0.0 };
-        let mut heap: Vec<(usize, f32)> = Vec::with_capacity(topn.min(rows.saturating_sub(1)));
-        for r in 0..rows {
-            if r == idx { continue; }
-            let uptr = unsafe { arr.uget_raw([r, 0]) as *const f32 };
-            let mut dot = 0.0f32; let mut nb = 0.0f32;
-            for i in 0..dim {
-                let a = v_slice[i];
-                let b = unsafe { std::ptr::read_unaligned(uptr.add(i)) };
-                dot += a * b; nb += b * b;
-            }
-            let sim = if na_sqrt == 0.0 || nb == 0.0 { 0.0 } else { dot / (na_sqrt * nb.sqrt()) };
-            if heap.len() < topn {
-                heap.push((r, sim));
-            } else if let Some(pos) = heap.iter().enumerate().min_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap()).map(|p| p.0) {
-                if sim > heap[pos].1 { heap[pos] = (r, sim); }
-            }
-        }
-        heap.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        Ok(heap
-            .into_iter()
-            .map(|(i, s)| (self.vocab[i].clone(), s))
-            .collect())
-    }
-
-    #[pyo3(signature = (key, level=None))]
-    fn get_vector<'py>(
-        &self,
-        py: Python<'py>,
-        key: &str,
-        level: Option<usize>,
-    ) -> PyResult<Bound<'py, PyArray1<f32>>> {
-        let use_dim = level.unwrap_or(self.vector_size).min(self.vector_size);
-        if let Some(map) = &self.vectors {
-            let v = map
-                .get(key)
-                .ok_or_else(|| PyKeyError::new_err(format!("word '{}' not in vocab", key)))?;
-            return Ok(v[..use_dim].to_vec().into_pyarray_bound(py));
-        }
-        let idx = *self
-            .index
-            .get(key)
-            .ok_or_else(|| PyKeyError::new_err(format!("word '{}' not in vocab", key)))?;
-        let memmap = self
-            .memmap
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("memmap not initialized"))?;
-        let row = memmap.bind(py).get_item(idx)?;
-        if use_dim == self.vector_size {
-            let arr: Bound<PyArray1<f32>> = row.downcast_into()?;
-            Ok(arr)
-        } else {
-            let sl = PySlice::new_bound(py, 0, use_dim as isize, 1);
-            let sub = row.get_item(sl)?;
-            let arr: Bound<PyArray1<f32>> = sub.downcast_into()?;
-            Ok(arr)
-        }
-    }
-
-    #[getter]
-    fn vector_size(&self) -> PyResult<usize> {
-        Ok(self.vector_size)
-    }
-
-    fn __getitem__<'py>(&self, py: Python<'py>, key: &str) -> PyResult<Bound<'py, PyArray1<f32>>> {
-        self.get_vector(py, key, None)
-    }
-
-    #[getter]
-    fn vectors<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f32>>> {
-        if let Some(map) = &self.vectors {
-            let rows = self.vocab.len();
-            let cols = self.vector_size;
-            let mut flat: Vec<f32> = Vec::with_capacity(rows * cols);
-            for w in &self.vocab {
-                let v = map
-                    .get(w)
-                    .ok_or_else(|| PyValueError::new_err("missing vector in map"))?;
-                if v.len() != cols {
-                    return Err(PyValueError::new_err("inconsistent vector size"));
-                }
-                flat.extend_from_slice(v);
-            }
-            let arr1d = flat.into_pyarray_bound(py);
-            let reshaped = arr1d.getattr("reshape")?.call1((rows, cols))?;
-            let arr2d: Bound<PyArray2<f32>> = reshaped.downcast_into()?;
-            Ok(arr2d)
-        } else {
-            // memmap-backed numpy array
-            let memmap = self
-                .memmap
-                .as_ref()
-                .ok_or_else(|| PyValueError::new_err("memmap not initialized"))?;
-            let mm = memmap.bind(py);
-            let arr: Bound<PyArray2<f32>> = mm.clone().downcast_into()?;
-            Ok(arr)
-        }
-    }
-
-    #[getter]
-    fn index_to_key(&self) -> PyResult<Vec<String>> {
-        Ok(self.vocab.clone())
-    }
-}
 
 #[pyclass(module = "word2vec_matryoshka")]
 /// Trainable Word2Vec model supporting Matryoshka levels.
@@ -864,62 +493,16 @@ impl Word2Vec {
             // Emit an initial 0.00% line at epoch start when logging
             if want_progress && verbose_flag {
                 let frac0 = 0.0f64;
-                // Alpha at the start of the epoch is the per-epoch starting lr
-                let alpha0 = lr;
-                Python::with_gil(|py| {
-                    if let Ok(logging) = PyModule::import_bound(py, "logging") {
-                        if !LOGGING_READY.swap(true, Ordering::Relaxed) {
-                            if let Ok(logger0) = logging
-                                .getattr("getLogger")
-                                .and_then(|f| f.call1(("word2vec_matryoshka",)))
-                            {
-                                if let Ok(handlers) = logger0.getattr("handlers") {
-                                    let len: usize = handlers
-                                        .getattr("__len__")
-                                        .and_then(|l| l.call0())
-                                        .and_then(|v| v.extract())
-                                        .unwrap_or(0);
-                                    if len == 0 {
-                                        if let (Ok(sh), Ok(fmtmod)) = (
-                                            logging
-                                                .getattr("StreamHandler")
-                                                .and_then(|c| c.call0()),
-                                            logging.getattr("Formatter"),
-                                        ) {
-                                            if let Ok(fmt) = fmtmod.call1((
-                                                "%(asctime)s: %(levelname)s: %(message)s",
-                                                "%Y-%m-%d %H:%M:%S",
-                                            )) {
-                                                let _ = sh.call_method1("setFormatter", (fmt,));
-                                            }
-                                            let _ = logger0.call_method1("addHandler", (sh,));
-                                            if let Ok(info) = logging.getattr("INFO") {
-                                                let _ = logger0.call_method1("setLevel", (info,));
-                                            }
-                                            let _ = logger0.setattr("propagate", true);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if let Ok(logger) = logging
-                            .getattr("getLogger")
-                            .and_then(|f| f.call1(("word2vec_matryoshka",)))
-                        {
-                            let _ = logger.call_method1(
-                                "info",
-                                (format!(
-                                    "EPOCH {}/{}: PROGRESS at {:.2}% tokens, alpha {:.5}, {} tokens/s",
-                                    e + 1,
-                                    epochs,
-                                    frac0 * 100.0,
-                                    alpha0,
-                                    0u64
-                                ),),
-                            );
-                        }
-                    }
-                });
+                let alpha0 = lr; // per-epoch starting lr
+                let msg = format!(
+                    "EPOCH {}/{}: PROGRESS at {:.2}% tokens, alpha {:.5}, {} tokens/s",
+                    e + 1,
+                    epochs,
+                    frac0 * 100.0,
+                    alpha0,
+                    0u64
+                );
+                log_info_msg(&msg);
             }
             if use_parallel {
                 // Parallel path with striped locks
@@ -983,62 +566,7 @@ impl Word2Vec {
                                         alpha,
                                         rate.round() as u64
                                     );
-                                    Python::with_gil(|py| {
-                                        if let Ok(logging) = PyModule::import_bound(py, "logging") {
-                                            // ensure a default handler if user hasn't configured logging
-                                            if !LOGGING_READY.swap(true, Ordering::Relaxed) {
-                                                if let Ok(logger) = logging
-                                                    .getattr("getLogger")
-                                                    .and_then(|f| f.call1(("word2vec_matryoshka",)))
-                                                {
-                                                    if let Ok(handlers) = logger.getattr("handlers")
-                                                    {
-                                                        let len: usize = handlers
-                                                            .getattr("__len__")
-                                                            .and_then(|l| l.call0())
-                                                            .and_then(|v| v.extract())
-                                                            .unwrap_or(0);
-                                                        if len == 0 {
-                                                            if let (Ok(sh), Ok(fmtmod)) = (
-                                                                logging
-                                                                    .getattr("StreamHandler")
-                                                                    .and_then(|c| c.call0()),
-                                                                logging.getattr("Formatter"),
-                                                            ) {
-                                                                let fmt = fmtmod.call1(("%(asctime)s: %(levelname)s: %(message)s", "%Y-%m-%d %H:%M:%S"));
-                                                                if let Ok(f) = fmt {
-                                                                    let _ = sh.call_method1(
-                                                                        "setFormatter",
-                                                                        (f,),
-                                                                    );
-                                                                }
-                                                                let _ = logger.call_method1(
-                                                                    "addHandler",
-                                                                    (sh,),
-                                                                );
-                                                                if let Ok(info) =
-                                                                    logging.getattr("INFO")
-                                                                {
-                                                                    let _ = logger.call_method1(
-                                                                        "setLevel",
-                                                                        (info,),
-                                                                    );
-                                                                }
-                                                                let _ = logger
-                                                                    .setattr("propagate", true);
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            if let Ok(logger) = logging
-                                                .getattr("getLogger")
-                                                .and_then(|f| f.call1(("word2vec_matryoshka",)))
-                                            {
-                                                let _ = logger.call_method1("info", (msg,));
-                                            }
-                                        }
-                                    });
+                                    log_info_msg(&msg);
                                 }
                                 if let Some(cb) = &progress_rep {
                                     Python::with_gil(|py| {
@@ -1051,7 +579,11 @@ impl Word2Vec {
                     });
                     (Some(processed), Some(stop_flag), Some(reporter))
                 } else {
-                    (None, None, None)
+                    (
+                        None::<Arc<AtomicU64>>,
+                        None::<Arc<AtomicBool>>,
+                        None::<std::thread::JoinHandle<()>>,
+                    )
                 };
                 let w_in_sw = w_in_sw_main.as_ref().unwrap().clone();
                 let w_out_sw = w_out_sw_main.as_ref().unwrap().clone();
@@ -1345,126 +877,122 @@ impl Word2Vec {
                         if sent_idx.is_empty() {
                             continue;
                         }
-                        for (i, &center) in sent_idx.iter().enumerate() {
-                            let b = rng.gen_range(0..=win);
-                            let start = i.saturating_sub(win - b);
-                            let end = (i + win - b + 1).min(sent_idx.len());
-                            if sg_flag {
-                                for j in start..end {
-                                    if j == i {
-                                        continue;
-                                    }
-                                    let context = sent_idx[j];
-                                    if hs_flag {
-                                        for &ldim in &levels_all {
-                                            crate::training::hs::hs_update(
-                                                &mut self.w_in,
-                                                &mut self.w_out,
-                                                center,
-                                                &self.hs_codes[context],
-                                                &self.hs_points[context],
-                                                lr / (levels_all.len() as f32),
-                                                ldim,
-                                            );
-                                        }
-                                    } else {
-                                        if !self.alias_prob.is_empty() {
-                                            crate::training::ns::sgns_update_levels_alias(
-                                                &mut self.w_in,
-                                                &mut self.w_out,
-                                                center,
-                                                context,
-                                                neg,
-                                                lr,
-                                                &levels_all,
-                                                self.vector_size,
-                                                &self.alias_prob,
-                                                &self.alias_alias,
-                                                &mut rng,
-                                            );
-                                        } else {
-                                            crate::training::ns::sgns_update_levels(
-                                                &mut self.w_in,
-                                                &mut self.w_out,
-                                                center,
-                                                context,
-                                                neg,
-                                                lr,
-                                                &levels_all,
-                                                self.vector_size,
-                                                vocab_len,
-                                                &mut rng,
-                                            );
-                                        }
-                                    }
-                                }
-                            } else {
-                                let mut ctx_indices: Vec<usize> = Vec::new();
-                                for j in start..end {
-                                    if j == i {
-                                        continue;
-                                    }
-                                    ctx_indices.push(sent_idx[j]);
-                                }
-                                if !ctx_indices.is_empty() {
-                                    if hs_flag {
-                                        for &ldim in &levels_all {
-                                            crate::training::hs::hs_update_cbow(
-                                                &mut self.w_in,
-                                                &mut self.w_out,
-                                                &ctx_indices,
-                                                &self.hs_codes[center],
-                                                &self.hs_points[center],
-                                                lr / (levels_all.len() as f32),
-                                                ldim,
-                                                self.cbow_mean,
-                                            );
-                                        }
-                                    } else {
-                                        for &ldim in &levels_all {
-                                            if !self.alias_prob.is_empty() {
-                                                crate::training::ns::sgns_update_cbow_alias(
+                        // compute step moved below under py.allow_threads
+                        if want_progress {
+                            // Training compute without the GIL; count processed centers
+                            let tokens_done = py.allow_threads(|| {
+                                let mut processed = 0u64;
+                                for (i, &center) in sent_idx.iter().enumerate() {
+                                    let b = rng.gen_range(0..=win);
+                                    let start = i.saturating_sub(win - b);
+                                    let end = (i + win - b + 1).min(sent_idx.len());
+                                    if sg_flag {
+                                        for j in start..end {
+                                            if j == i { continue; }
+                                            let context = sent_idx[j];
+                                            if hs_flag {
+                                                for &ldim in &levels_all {
+                                                    crate::training::hs::hs_update(
+                                                        &mut self.w_in,
+                                                        &mut self.w_out,
+                                                        center,
+                                                        &self.hs_codes[context],
+                                                        &self.hs_points[context],
+                                                        lr / (levels_all.len() as f32),
+                                                        ldim,
+                                                    );
+                                                }
+                                            } else if !self.alias_prob.is_empty() {
+                                                crate::training::ns::sgns_update_levels_alias(
                                                     &mut self.w_in,
                                                     &mut self.w_out,
-                                                    &ctx_indices,
                                                     center,
+                                                    context,
                                                     neg,
-                                                    lr / (levels_all.len() as f32),
-                                                    ldim,
+                                                    lr,
+                                                    &levels_all,
+                                                    self.vector_size,
                                                     &self.alias_prob,
                                                     &self.alias_alias,
                                                     &mut rng,
-                                                    self.cbow_mean,
                                                 );
                                             } else {
-                                                crate::training::ns::sgns_update_cbow(
+                                                crate::training::ns::sgns_update_levels(
                                                     &mut self.w_in,
                                                     &mut self.w_out,
-                                                    &ctx_indices,
                                                     center,
+                                                    context,
                                                     neg,
-                                                    lr / (levels_all.len() as f32),
-                                                    ldim,
+                                                    lr,
+                                                    &levels_all,
+                                                    self.vector_size,
                                                     vocab_len,
                                                     &mut rng,
-                                                    self.cbow_mean,
                                                 );
                                             }
                                         }
+                                    } else {
+                                        let mut ctx_indices: Vec<usize> = Vec::new();
+                                        for j in start..end { if j != i { ctx_indices.push(sent_idx[j]); } }
+                                        if !ctx_indices.is_empty() {
+                                            if hs_flag {
+                                                for &ldim in &levels_all {
+                                                    crate::training::hs::hs_update_cbow(
+                                                        &mut self.w_in,
+                                                        &mut self.w_out,
+                                                        &ctx_indices,
+                                                        &self.hs_codes[center],
+                                                        &self.hs_points[center],
+                                                        lr / (levels_all.len() as f32),
+                                                        ldim,
+                                                        self.cbow_mean,
+                                                    );
+                                                }
+                                            } else {
+                                                for &ldim in &levels_all {
+                                                    if !self.alias_prob.is_empty() {
+                                                        crate::training::ns::sgns_update_cbow_alias(
+                                                            &mut self.w_in,
+                                                            &mut self.w_out,
+                                                            &ctx_indices,
+                                                            center,
+                                                            neg,
+                                                            lr / (levels_all.len() as f32),
+                                                            ldim,
+                                                            &self.alias_prob,
+                                                            &self.alias_alias,
+                                                            &mut rng,
+                                                            self.cbow_mean,
+                                                        );
+                                                    } else {
+                                                        crate::training::ns::sgns_update_cbow(
+                                                            &mut self.w_in,
+                                                            &mut self.w_out,
+                                                            &ctx_indices,
+                                                            center,
+                                                            neg,
+                                                            lr / (levels_all.len() as f32),
+                                                            ldim,
+                                                            vocab_len,
+                                                            &mut rng,
+                                                            self.cbow_mean,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
+                                    processed += 1;
                                 }
-                            }
-                        }
-                        if want_progress {
-                            processed_epoch += sent_idx.len() as u64;
+                                processed
+                            });
+                            processed_epoch += tokens_done;
                             let now = Instant::now();
                             if now.duration_since(last).as_secs_f64() >= interval {
                                 last = now;
                                 let done = base_done + processed_epoch;
                                 if verbose_flag {
-                                    let frac = if total_all > 0 {
-                                        (done as f64) / (total_all as f64)
-                                    } else { 0.0 };
+                                    let frac = if total_all > 0 { (done as f64) / (total_all as f64) } else { 0.0 };
                                     let elapsed = now.duration_since(t0).as_secs_f64();
                                     let rate = if elapsed > 0.0 { (done as f64) / elapsed } else { 0.0 };
                                     let mut alpha = lr0 - (lr0 - min_alpha) * (done as f32) / (total_all as f32);
@@ -1480,6 +1008,70 @@ impl Word2Vec {
                                     let _ = bound.call1((done, total_all));
                                 }
                             }
+                        } else {
+                            // No progress requested: still compute without the GIL
+                            let _ = py.allow_threads(|| {
+                                for (i, &center) in sent_idx.iter().enumerate() {
+                                    let b = rng.gen_range(0..=win);
+                                    let start = i.saturating_sub(win - b);
+                                    let end = (i + win - b + 1).min(sent_idx.len());
+                                    if sg_flag {
+                                        for j in start..end {
+                                            if j == i { continue; }
+                                            let context = sent_idx[j];
+                                            if hs_flag {
+                                                for &ldim in &levels_all {
+                                                    crate::training::hs::hs_update(
+                                                        &mut self.w_in, &mut self.w_out, center,
+                                                        &self.hs_codes[context], &self.hs_points[context],
+                                                        lr / (levels_all.len() as f32), ldim,
+                                                    );
+                                                }
+                                            } else if !self.alias_prob.is_empty() {
+                                                crate::training::ns::sgns_update_levels_alias(
+                                                    &mut self.w_in, &mut self.w_out, center, context,
+                                                    neg, lr, &levels_all, self.vector_size,
+                                                    &self.alias_prob, &self.alias_alias, &mut rng,
+                                                );
+                                            } else {
+                                                crate::training::ns::sgns_update_levels(
+                                                    &mut self.w_in, &mut self.w_out, center, context,
+                                                    neg, lr, &levels_all, self.vector_size, vocab_len, &mut rng,
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        let mut ctx_indices: Vec<usize> = Vec::new();
+                                        for j in start..end { if j != i { ctx_indices.push(sent_idx[j]); } }
+                                        if !ctx_indices.is_empty() {
+                                            if hs_flag {
+                                                for &ldim in &levels_all {
+                                                    crate::training::hs::hs_update_cbow(
+                                                        &mut self.w_in, &mut self.w_out, &ctx_indices, &self.hs_codes[center],
+                                                        &self.hs_points[center], lr / (levels_all.len() as f32), ldim, self.cbow_mean,
+                                                    );
+                                                }
+                                            } else {
+                                                for &ldim in &levels_all {
+                                                    if !self.alias_prob.is_empty() {
+                                                        crate::training::ns::sgns_update_cbow_alias(
+                                                            &mut self.w_in, &mut self.w_out, &ctx_indices, center, neg,
+                                                            lr / (levels_all.len() as f32), ldim,
+                                                            &self.alias_prob, &self.alias_alias, &mut rng, self.cbow_mean,
+                                                        );
+                                                    } else {
+                                                        crate::training::ns::sgns_update_cbow(
+                                                            &mut self.w_in, &mut self.w_out, &ctx_indices, center, neg,
+                                                            lr / (levels_all.len() as f32), ldim, vocab_len, &mut rng, self.cbow_mean,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                            processed_epoch += sent_idx.len() as u64;
                         }
                     }
                     if want_progress && verbose_flag {
@@ -1510,30 +1102,7 @@ impl Word2Vec {
                             alpha,
                             rate.round() as u64
                         );
-                        let logging = PyModule::import_bound(py, "logging")?;
-                        if !LOGGING_READY.swap(true, Ordering::Relaxed) {
-                            let logger0 = logging
-                                .getattr("getLogger")?
-                                .call1(("word2vec_matryoshka",))?;
-                            let handlers = logger0.getattr("handlers")?;
-                            let hlen: usize = handlers.getattr("__len__")?.call0()?.extract()?;
-                            if hlen == 0 {
-                                let sh = logging.getattr("StreamHandler")?.call0()?;
-                                let fmt = logging.getattr("Formatter")?.call1((
-                                    "%(asctime)s: %(levelname)s: %(message)s",
-                                    "%Y-%m-%d %H:%M:%S",
-                                ))?;
-                                let _ = sh.call_method1("setFormatter", (fmt,));
-                                let _ = logger0.call_method1("addHandler", (sh,));
-                                let _ =
-                                    logger0.call_method1("setLevel", (logging.getattr("INFO")?,));
-                                let _ = logger0.setattr("propagate", true);
-                            }
-                        }
-                        let logger = logging
-                            .getattr("getLogger")?
-                            .call1(("word2vec_matryoshka",))?;
-                        let _ = logger.call_method1("info", (msg,));
+                        log_info_msg(&msg);
                     }
                     Ok(())
                 })?;

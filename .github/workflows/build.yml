@@ -20,7 +20,7 @@ jobs:
           - os: macos-latest
             cibw_arch: arm64
           - os: windows-latest
-            cibw_arch: x86_64
+            cibw_arch: amd64
 
     env:
       CIBW_BUILD: "cp310-*"

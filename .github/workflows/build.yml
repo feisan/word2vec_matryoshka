@@ -21,12 +21,21 @@ jobs:
             cibw_arch: AMD64
 
     env:
+      # abi3：每平台仅构一次（最低 3.10）
       CIBW_BUILD: "cp310-*"
+      # 如不需要 musllinux，可追加 *-musllinux* 跳过
       CIBW_SKIP: "*-win32 *-manylinux_i686"
+
+      # 各平台目标架构
       CIBW_ARCHS_LINUX: ${{ matrix.cibw_arch }}
       CIBW_ARCHS_MACOS: ${{ matrix.cibw_arch }}
       CIBW_ARCHS_WINDOWS: ${{ matrix.cibw_arch }}
-      CIBW_TEST_COMMAND: "python -c \"import word2vec_matryoshka as m; print(getattr(m, '__version__', 'ok'))\""
+
+      # Linux 使用 manylinux_2_28 基线（更新）
+      CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+      CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_28
+
+      # 在 Linux 容器（manylinux/musllinux）内部安装 Rust
       CIBW_BEFORE_ALL_LINUX: >
         /bin/sh -exc '
           if command -v apk >/dev/null 2>&1; then
@@ -40,11 +49,20 @@ jobs:
         '
       CIBW_ENVIRONMENT_LINUX: "PATH=$HOME/.cargo/bin:$PATH"
 
+      # macOS：universal2 需要最低 11.0；设置部署目标更稳
+      CIBW_ENVIRONMENT_MACOS: "MACOSX_DEPLOYMENT_TARGET=11.0"
+
+      # 冒烟测试：导入并打印版本
+      CIBW_TEST_COMMAND: "python -c \"import word2vec_matryoshka as m; print(getattr(m, '__version__', 'ok'))\""
+
     steps:
       - uses: actions/checkout@v4
 
+      # 主机侧安装 Rust；macOS universal2 需要双目标
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
 
       - name: Build wheels (abi3)
         uses: pypa/cibuildwheel@v3.1.4

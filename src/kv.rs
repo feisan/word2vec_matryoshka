@@ -166,50 +166,32 @@ impl KeyedVectors {
         }
         // In-memory fast path
         if let Some(map) = &self.vectors {
-            let v = map
-                .get(word)
-                .ok_or_else(|| PyKeyError::new_err(format!("word '{}' not in vocab", word)))?;
-            let v_slice = &v[..use_dim];
-            // Precompute norm of the query once
-            let mut na = 0.0f32;
-            for i in 0..use_dim {
-                na += v_slice[i] * v_slice[i];
-            }
-            let na_sqrt = if na > 0.0 { na.sqrt() } else { 0.0 };
-            let n = self.vocab.len();
-            let k = topn.min(n.saturating_sub(1));
-            let mut heap: Vec<(String, f32)> = Vec::with_capacity(k);
-            for (w, u) in map.iter() {
-                if w == word {
-                    continue;
-                }
-                // Compute cosine using cached query norm
-                let mut dot = 0.0f32;
-                let mut nb = 0.0f32;
-                for i in 0..use_dim {
-                    let a = v_slice[i];
-                    let b = u[i];
-                    dot += a * b;
-                    nb += b * b;
-                }
-                let sim = if na_sqrt == 0.0 || nb == 0.0 {
-                    0.0
-                } else {
-                    dot / (na_sqrt * nb.sqrt())
-                };
-                if heap.len() < k {
-                    heap.push((w.clone(), sim));
-                } else if let Some(pos) = heap
-                    .iter()
-                    .enumerate()
-                    .min_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap())
-                    .map(|p| p.0)
-                {
-                    if sim > heap[pos].1 {
-                        heap[pos] = (w.clone(), sim);
+            // Heavy O(n·d) loop: release the GIL
+            let heap: Vec<(String, f32)> = py.allow_threads(|| {
+                let v = map
+                    .get(word)
+                    .expect("checked above");
+                let v_slice = &v[..use_dim];
+                let mut na = 0.0f32;
+                for i in 0..use_dim { na += v_slice[i] * v_slice[i]; }
+                let na_sqrt = if na > 0.0 { na.sqrt() } else { 0.0 };
+                let n = self.vocab.len();
+                let k = topn.min(n.saturating_sub(1));
+                let mut heap: Vec<(String, f32)> = Vec::with_capacity(k);
+                for (w, u) in map.iter() {
+                    if w == word { continue; }
+                    let mut dot = 0.0f32; let mut nb = 0.0f32;
+                    for i in 0..use_dim { let a = v_slice[i]; let b = u[i]; dot += a * b; nb += b * b; }
+                    let sim = if na_sqrt == 0.0 || nb == 0.0 { 0.0 } else { dot / (na_sqrt * nb.sqrt()) };
+                    if heap.len() < k {
+                        heap.push((w.clone(), sim));
+                    } else if let Some(pos) = heap.iter().enumerate().min_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap()).map(|p| p.0) {
+                        if sim > heap[pos].1 { heap[pos] = (w.clone(), sim); }
                     }
                 }
-            }
+                heap
+            });
+            let mut heap = heap;
             heap.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             return Ok(heap);
         }
@@ -222,61 +204,51 @@ impl KeyedVectors {
             .memmap
             .as_ref()
             .ok_or_else(|| PyValueError::new_err("memmap not initialized"))?;
+        // Bind array and capture raw metadata under the GIL
         let mm = memmap.bind(py);
-        // Use raw element pointers (uget_raw) to avoid ndarray alignment constraints
         let arr: Bound<PyArray2<f32>> = mm.clone().downcast_into()?;
         let shape = arr.shape();
         let rows = shape[0];
         let cols = shape[1];
         let dim = use_dim.min(cols);
-        let vptr = unsafe { arr.uget_raw([idx, 0]) as *const f32 };
-        let mut v_slice: Vec<f32> = vec![0.0; dim];
-        for i in 0..dim {
-            v_slice[i] = unsafe { std::ptr::read_unaligned(vptr.add(i)) };
-        }
-        // Precompute query norm once
-        let mut na = 0.0f32;
-        for i in 0..dim {
-            na += v_slice[i] * v_slice[i];
-        }
-        let na_sqrt = if na > 0.0 { na.sqrt() } else { 0.0 };
-        let mut heap: Vec<(usize, f32)> = Vec::with_capacity(topn.min(rows.saturating_sub(1)));
-        for r in 0..rows {
-            if r == idx {
-                continue;
-            }
-            let uptr = unsafe { arr.uget_raw([r, 0]) as *const f32 };
-            let mut dot = 0.0f32;
-            let mut nb = 0.0f32;
+        // Pointer address to the first element; .npy is row-major (fortran_order=False)
+        let base_addr = unsafe { arr.uget_raw([0, 0]) as *const f32 as usize };
+        // Release the GIL for the O(n·d) similarity scan
+        let heap: Vec<(usize, f32)> = py.allow_threads(|| {
+            let base_ptr = base_addr as *const f32;
+            // Read query prefix
+            let qptr = unsafe { base_ptr.add(idx * cols) };
+            let mut v_slice: Vec<f32> = vec![0.0; dim];
             for i in 0..dim {
-                let a = v_slice[i];
-                let b = unsafe { std::ptr::read_unaligned(uptr.add(i)) };
-                dot += a * b;
-                nb += b * b;
+                v_slice[i] = unsafe { std::ptr::read_unaligned(qptr.add(i)) };
             }
-            let sim = if na_sqrt == 0.0 || nb == 0.0 {
-                0.0
-            } else {
-                dot / (na_sqrt * nb.sqrt())
-            };
-            if heap.len() < topn {
-                heap.push((r, sim));
-            } else if let Some(pos) = heap
-                .iter()
-                .enumerate()
-                .min_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap())
-                .map(|p| p.0)
-            {
-                if sim > heap[pos].1 {
-                    heap[pos] = (r, sim);
+            // Precompute query norm
+            let mut na = 0.0f32;
+            for i in 0..dim { na += v_slice[i] * v_slice[i]; }
+            let na_sqrt = if na > 0.0 { na.sqrt() } else { 0.0 };
+            let mut heap: Vec<(usize, f32)> = Vec::with_capacity(topn.min(rows.saturating_sub(1)));
+            for r in 0..rows {
+                if r == idx { continue; }
+                let uptr = unsafe { base_ptr.add(r * cols) };
+                let mut dot = 0.0f32; let mut nb = 0.0f32;
+                for i in 0..dim {
+                    let a = v_slice[i];
+                    let b = unsafe { std::ptr::read_unaligned(uptr.add(i)) };
+                    dot += a * b; nb += b * b;
+                }
+                let sim = if na_sqrt == 0.0 || nb == 0.0 { 0.0 } else { dot / (na_sqrt * nb.sqrt()) };
+                if heap.len() < topn {
+                    heap.push((r, sim));
+                } else if let Some(pos) = heap.iter().enumerate().min_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap()).map(|p| p.0) {
+                    if sim > heap[pos].1 { heap[pos] = (r, sim); }
                 }
             }
-        }
+            heap
+        });
+        // Sort and map to tokens under the GIL again
+        let mut heap = heap;
         heap.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        Ok(heap
-            .into_iter()
-            .map(|(i, s)| (self.vocab[i].clone(), s))
-            .collect())
+        Ok(heap.into_iter().map(|(i, s)| (self.vocab[i].clone(), s)).collect())
     }
 
     #[pyo3(signature = (key, level=None))]
@@ -327,16 +299,16 @@ impl KeyedVectors {
         if let Some(map) = &self.vectors {
             let rows = self.vocab.len();
             let cols = self.vector_size;
-            let mut flat: Vec<f32> = Vec::with_capacity(rows * cols);
-            for w in &self.vocab {
-                let v = map
-                    .get(w)
-                    .ok_or_else(|| PyValueError::new_err("missing vector in map"))?;
-                if v.len() != cols {
-                    return Err(PyValueError::new_err("inconsistent vector size"));
+            // Build the flat buffer without the GIL
+            let flat: Vec<f32> = py.allow_threads(|| {
+                let mut flat = Vec::with_capacity(rows * cols);
+                for w in &self.vocab {
+                    let v = map.get(w).expect("vocab and map out of sync");
+                    debug_assert_eq!(v.len(), cols);
+                    flat.extend_from_slice(v);
                 }
-                flat.extend_from_slice(v);
-            }
+                flat
+            });
             let arr1d = flat.into_pyarray_bound(py);
             let reshaped = arr1d.getattr("reshape")?.call1((rows, cols))?;
             let arr2d: Bound<PyArray2<f32>> = reshaped.downcast_into()?;
@@ -358,4 +330,3 @@ impl KeyedVectors {
         Ok(self.vocab.clone())
     }
 }
-

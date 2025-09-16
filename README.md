@@ -40,6 +40,11 @@ sims = model.wv.most_similar("hello", topn=5, level=32)
 model.wv.save("vectors")
 wv = KeyedVectors.load("vectors", mmap="r")  # zero-copy memmap
 vec16 = wv.get_vector("hello", level=16)
+
+# Inspect vocabulary and the vector matrix
+print(wv.index_to_key[:5])    # e.g., ['hello', 'computer', ...]
+M = wv.vectors                # numpy.ndarray with shape (n_words, vector_size)
+print(M.shape)
 ```
 
 ## What’s inside
@@ -58,4 +63,3 @@ vec16 = wv.get_vector("hello", level=16)
 ## License
 
 MIT — see `LICENSE`.
-

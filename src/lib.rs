@@ -21,7 +21,7 @@
 )]
 use ahash::AHashMap as HashMap;
 use once_cell::sync::Lazy;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyKeyboardInterrupt, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyIterator, PyModule, PyType};
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -349,6 +349,7 @@ impl Word2Vec {
         let hs_flag = self.hs;
 
         let use_parallel = self._workers > 1;
+        let interrupt = Arc::new(AtomicBool::new(false));
         // Prepare sentences (read-only)
         let sents_idx = sentences_to_indices(&corpus_iterable, &self.vocab)?;
         // Keep an owned handle to the Python iterable for multi-epoch/branch reuse
@@ -454,6 +455,11 @@ impl Word2Vec {
             ));
         }
         for e in 0..epochs {
+            // Before starting a new epoch, honor any pending KeyboardInterrupt
+            Python::with_gil(|py| -> PyResult<()> { py.check_signals()?; Ok(()) })?;
+            if interrupt.load(Ordering::Relaxed) {
+                return Err(PyKeyboardInterrupt::new_err("training interrupted"));
+            }
             let epoch_start = Instant::now();
             let frac = (e as f32) / (epochs as f32);
             let mut lr = lr0 - (lr0 - min_alpha) * frac;
@@ -518,6 +524,7 @@ impl Word2Vec {
                         progress.as_ref().map(|p| p.clone().unbind());
                     let processed_rep = processed.clone();
                     let stop_rep = stop_flag.clone();
+                    let interrupt_rep = interrupt.clone();
                     let progress_rep = progress_cb;
                     let verbose_rep = verbose_flag;
                     let lr0_rep = lr0;
@@ -529,11 +536,17 @@ impl Word2Vec {
                         let tick = std::cmp::min(interval, Duration::from_millis(50));
                         let mut acc = Duration::from_millis(0);
                         loop {
-                            if stop_rep.load(Ordering::Relaxed) {
+                            if stop_rep.load(Ordering::Relaxed) || interrupt_rep.load(Ordering::Relaxed) {
                                 break;
                             }
                             std::thread::sleep(tick);
                             acc += tick;
+                            // also honor KeyboardInterrupt promptly from the reporter thread
+                            Python::with_gil(|py| {
+                                if py.check_signals().is_err() {
+                                    interrupt_rep.store(true, Ordering::Relaxed);
+                                }
+                            });
                             if acc >= interval {
                                 acc = Duration::from_millis(0);
                                 let now = Instant::now();
@@ -603,7 +616,10 @@ impl Word2Vec {
                 let processed_arc = processed_opt.clone();
                 std::thread::spawn(move || {
                     // Larger batch size amortizes GIL and channel overhead
-                    const CHUNK: usize = 8192;
+                    let chunk_cap: usize = std::env::var("W2V_CHUNK")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(8192);
                     // Create a persistent Python iterator handle, then pull items in short GIL windows
                     let iter_handle: Option<Py<PyAny>> = Python::with_gil(|py| {
                         let bound = sentences_obj.bind(py);
@@ -613,13 +629,13 @@ impl Word2Vec {
                         }
                     });
                     if let Some(iter_obj) = iter_handle {
-                        let mut chunk: Vec<Vec<usize>> = Vec::with_capacity(CHUNK);
+                        let mut chunk: Vec<Vec<usize>> = Vec::with_capacity(chunk_cap);
                         loop {
                             let mut ended = false;
                             // Pull up to CHUNK items under the GIL, then release to let other threads (e.g., logger) run
                             Python::with_gil(|py| {
                                 let it = iter_obj.bind(py);
-                                for _ in 0..CHUNK {
+                                for _ in 0..chunk_cap {
                                     match it.call_method0("__next__") {
                                         Ok(item) => {
                                             if let Ok(seq) = item.extract::<Vec<String>>() {
@@ -650,7 +666,7 @@ impl Word2Vec {
                         }
                     }
                 });
-                Python::with_gil(|py| {
+                let run_res: PyResult<()> = Python::with_gil(|py| -> PyResult<()> {
                     let total_epoch_u64 = total_per_epoch as u64;
                     use std::sync::mpsc::RecvTimeoutError;
                     loop {
@@ -808,11 +824,13 @@ impl Word2Vec {
                                 });
                             });
                         });
-                        // Check for KeyboardInterrupt after each chunk
-                        if py.check_signals().is_err() {
-                            break;
+                        // Propagate KeyboardInterrupt after each chunk and set shared flag
+                        if let Err(e) = py.check_signals() {
+                            interrupt.store(true, Ordering::Relaxed);
+                            return Err(e);
                         }
                     }
+                    Ok(())
                 });
                 // Signal the reporter to stop and drain any remaining updates
                 if let Some(flag) = &stop_flag_opt {
@@ -821,8 +839,21 @@ impl Word2Vec {
                 if let Some(rep) = reporter_opt {
                     let _ = rep.join();
                 }
+                // Propagate any interrupt after cleaning up background threads
+                if let Err(e) = run_res {
+                    return Err(e);
+                }
+                // Catch any pending signals which may have arrived between the last
+                // chunk and loop exit (e.g., right at epoch boundary)
+                if let Err(e) = Python::with_gil(|py| -> PyResult<()> { py.check_signals()?; Ok(()) }) {
+                    interrupt.store(true, Ordering::Relaxed);
+                    return Err(e);
+                }
+                if interrupt.load(Ordering::Relaxed) {
+                    return Err(PyKeyboardInterrupt::new_err("training interrupted"));
+                }
                 // Epoch end summary for parallel path (after reporter stops)
-                if verbose_flag {
+                if verbose_flag && !interrupt.load(Ordering::Relaxed) {
                     let tokens_epoch: u64 = processed_opt
                         .as_ref()
                         .map(|p| p.load(Ordering::Relaxed))
@@ -882,6 +913,8 @@ impl Word2Vec {
                             // Training compute without the GIL; count processed centers
                             let tokens_done = py.allow_threads(|| {
                                 let mut processed = 0u64;
+                                // Reuse a single context buffer across centers
+                                let mut ctx_indices: Vec<usize> = Vec::with_capacity(2 * win + 1);
                                 for (i, &center) in sent_idx.iter().enumerate() {
                                     let b = rng.gen_range(0..=win);
                                     let start = i.saturating_sub(win - b);
@@ -932,7 +965,7 @@ impl Word2Vec {
                                             }
                                         }
                                     } else {
-                                        let mut ctx_indices: Vec<usize> = Vec::new();
+                                        ctx_indices.clear();
                                         for j in start..end { if j != i { ctx_indices.push(sent_idx[j]); } }
                                         if !ctx_indices.is_empty() {
                                             if hs_flag {
@@ -1008,9 +1041,16 @@ impl Word2Vec {
                                     let _ = bound.call1((done, total_all));
                                 }
                             }
+                            // Propagate KeyboardInterrupt promptly and set shared flag
+                            if let Err(e) = py.check_signals() {
+                                interrupt.store(true, Ordering::Relaxed);
+                                return Err(e);
+                            }
                         } else {
                             // No progress requested: still compute without the GIL
                             let _ = py.allow_threads(|| {
+                                // Reuse a single context buffer across centers
+                                let mut ctx_indices: Vec<usize> = Vec::with_capacity(2 * win + 1);
                                 for (i, &center) in sent_idx.iter().enumerate() {
                                     let b = rng.gen_range(0..=win);
                                     let start = i.saturating_sub(win - b);
@@ -1041,7 +1081,7 @@ impl Word2Vec {
                                             }
                                         }
                                     } else {
-                                        let mut ctx_indices: Vec<usize> = Vec::new();
+                                        ctx_indices.clear();
                                         for j in start..end { if j != i { ctx_indices.push(sent_idx[j]); } }
                                         if !ctx_indices.is_empty() {
                                             if hs_flag {
@@ -1072,6 +1112,11 @@ impl Word2Vec {
                                 }
                             });
                             processed_epoch += sent_idx.len() as u64;
+                            // Propagate KeyboardInterrupt promptly and set shared flag
+                            if let Err(e) = py.check_signals() {
+                                interrupt.store(true, Ordering::Relaxed);
+                                return Err(e);
+                            }
                         }
                     }
                     if want_progress && verbose_flag {
@@ -1106,6 +1151,14 @@ impl Word2Vec {
                     }
                     Ok(())
                 })?;
+                // Catch any pending signals at epoch end before continuing
+                if let Err(e) = Python::with_gil(|py| -> PyResult<()> { py.check_signals()?; Ok(()) }) {
+                    interrupt.store(true, Ordering::Relaxed);
+                    return Err(e);
+                }
+                if interrupt.load(Ordering::Relaxed) {
+                    return Err(PyKeyboardInterrupt::new_err("training interrupted"));
+                }
             }
         }
         // Move weights back for parallel path
@@ -1118,14 +1171,18 @@ impl Word2Vec {
 
     #[getter]
     fn wv<'py>(&self, py: Python<'py>) -> PyResult<Py<KeyedVectors>> {
-        let mut map = HashMap::default();
-        let mut vocab = Vec::with_capacity(self.ivocab.len());
-        let mut index = HashMap::default();
-        for (idx, w) in self.ivocab.iter().enumerate() {
-            vocab.push(w.clone());
-            index.insert(w.clone(), idx);
-            map.insert(w.clone(), self.get_in_vec(idx).to_vec());
-        }
+        // Build the KeyedVectors payload without holding the GIL
+        let (map, vocab, index) = py.allow_threads(|| {
+            let mut map = HashMap::default();
+            let mut vocab = Vec::with_capacity(self.ivocab.len());
+            let mut index = HashMap::default();
+            for (idx, w) in self.ivocab.iter().enumerate() {
+                vocab.push(w.clone());
+                index.insert(w.clone(), idx);
+                map.insert(w.clone(), self.get_in_vec(idx).to_vec());
+            }
+            (map, vocab, index)
+        });
         let kv = KeyedVectors {
             vectors: Some(map),
             vector_size: self.vector_size,

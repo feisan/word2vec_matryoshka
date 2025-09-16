@@ -228,14 +228,20 @@ pub(crate) fn hs_update_cbow_striped(
     let mut h = take_tls_vec1(dim);
     // Group reads by shard
     let mut by_shard: [Vec<usize>; SHARDS] = std::array::from_fn(|_| Vec::new());
-    for &idx in context_indices { by_shard[idx % SHARDS].push(idx); }
+    for &idx in context_indices {
+        by_shard[idx % SHARDS].push(idx);
+    }
     for (s, rows) in by_shard.iter().enumerate() {
-        if rows.is_empty() { continue; }
+        if rows.is_empty() {
+            continue;
+        }
         let _g = w_in.shards[s].lock().unwrap();
         for &idx in rows {
             unsafe {
                 let r = w_in.row_prefix(idx, dim);
-                for k in 0..dim { h[k] += r[k]; }
+                for k in 0..dim {
+                    h[k] += r[k];
+                }
             }
         }
     }
@@ -251,15 +257,23 @@ pub(crate) fn hs_update_cbow_striped(
     }
     // Group writes by shard
     let mut by_shard_w: [Vec<usize>; SHARDS] = std::array::from_fn(|_| Vec::new());
-    for &idx in context_indices { by_shard_w[idx % SHARDS].push(idx); }
+    for &idx in context_indices {
+        by_shard_w[idx % SHARDS].push(idx);
+    }
     for (s, rows) in by_shard_w.iter().enumerate() {
-        if rows.is_empty() { continue; }
+        if rows.is_empty() {
+            continue;
+        }
         let _g = w_in.shards[s].lock().unwrap();
         for &idx in rows {
             unsafe {
                 let r = w_in.row_prefix_mut(idx, dim);
                 for k in 0..dim {
-                    r[k] += if cbow_mean { neu1e[k] / c.max(1.0) } else { neu1e[k] };
+                    r[k] += if cbow_mean {
+                        neu1e[k] / c.max(1.0)
+                    } else {
+                        neu1e[k]
+                    };
                 }
             }
         }

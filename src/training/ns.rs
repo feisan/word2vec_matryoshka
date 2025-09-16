@@ -4,8 +4,8 @@ use rand::rngs::StdRng;
 use rand::Rng;
 
 use crate::ops::{
-    accumulate_levels, dot_prefix, dual_axpy_prefix, give_tls_vec1, give_tls_vec2, sigmoid, take_tls_vec1,
-    take_tls_vec2,
+    accumulate_levels, dot_prefix, dual_axpy_prefix, give_tls_vec1, give_tls_vec2, sigmoid,
+    take_tls_vec1, take_tls_vec2,
 };
 use crate::sampling::alias::sample_alias;
 use crate::weights::{SharedWeights, SHARDS};
@@ -34,14 +34,26 @@ pub(crate) fn sgns_step_levels(
     let mut head_na = 0.0f32;
     let mut head_nb = 0.0f32;
     for &ldim in levels.iter() {
-        if ldim == 0 { continue; }
+        if ldim == 0 {
+            continue;
+        }
         let to = ldim.min(dim_full);
-        if to <= acc { continue; }
+        if to <= acc {
+            continue;
+        }
         // Use SIMD-optimized accumulation
         let mut dot_before = head_dot;
         let mut na_before = head_na;
         let mut nb_before = head_nb;
-        accumulate_levels(a_row, b_row, acc, to, &mut dot_before, &mut na_before, &mut nb_before);
+        accumulate_levels(
+            a_row,
+            b_row,
+            acc,
+            to,
+            &mut dot_before,
+            &mut na_before,
+            &mut nb_before,
+        );
         let pred = sigmoid(dot_before);
         let g = per_level_lr * (label - pred);
         // Update 0..to in-place
@@ -122,9 +134,13 @@ fn sgns_step_levels_locked_rows(
     let mut head_na = 0.0f32;
     let mut head_nb = 0.0f32;
     for &ldim in levels.iter() {
-        if ldim == 0 { continue; }
+        if ldim == 0 {
+            continue;
+        }
         let to = ldim.min(dim_full);
-        if to <= acc { continue; }
+        if to <= acc {
+            continue;
+        }
         let mut tail_dot = 0.0f32;
         let mut tail_na = 0.0f32;
         let mut tail_nb = 0.0f32;
@@ -178,7 +194,9 @@ pub(crate) fn sgns_update_levels_striped_batched(
         }
         for _ in 0..negative {
             let mut neg = rng.gen_range(0..vocab_size);
-            if neg == context { neg = (neg + 1) % vocab_size; }
+            if neg == context {
+                neg = (neg + 1) % vocab_size;
+            }
             let _gout = w_out.shards[neg % SHARDS].lock().unwrap();
             let b_row = w_out.row_mut(neg);
             sgns_step_levels_locked_rows(a_row, b_row, 0.0, per, levels, dim_full);
@@ -213,7 +231,9 @@ pub(crate) fn sgns_update_levels_alias_striped_batched(
         }
         for _ in 0..negative {
             let mut neg = sample_alias(prob, alias, rng);
-            if neg == context { neg = (neg + 1) % vocab_size; }
+            if neg == context {
+                neg = (neg + 1) % vocab_size;
+            }
             let _gout = w_out.shards[neg % SHARDS].lock().unwrap();
             let b_row = w_out.row_mut(neg);
             sgns_step_levels_locked_rows(a_row, b_row, 0.0, per, levels, dim_full);
@@ -238,7 +258,9 @@ pub(crate) fn sgns_update_levels(
     sgns_step_levels(w_in, w_out, center, context, 1.0, per, dim_full, levels);
     for _ in 0..negative {
         let mut neg = rng.gen_range(0..vocab_size);
-        if neg == context { neg = (neg + 1) % vocab_size; }
+        if neg == context {
+            neg = (neg + 1) % vocab_size;
+        }
         sgns_step_levels(w_in, w_out, center, neg, 0.0, per, dim_full, levels);
     }
 }
@@ -262,7 +284,9 @@ pub(crate) fn sgns_update_levels_alias(
     let vocab_size = prob.len();
     for _ in 0..negative {
         let mut neg = sample_alias(prob, alias, rng);
-        if neg == context { neg = (neg + 1) % vocab_size; }
+        if neg == context {
+            neg = (neg + 1) % vocab_size;
+        }
         sgns_step_levels(w_in, w_out, center, neg, 0.0, per, dim_full, levels);
     }
 }
@@ -284,14 +308,20 @@ pub(crate) fn sgns_update_cbow_striped(
     let mut h = take_tls_vec1(dim);
     // Group reads by shard to reduce lock acquisition overhead
     let mut by_shard: [Vec<usize>; SHARDS] = std::array::from_fn(|_| Vec::new());
-    for &idx in context_indices { by_shard[idx % SHARDS].push(idx); }
+    for &idx in context_indices {
+        by_shard[idx % SHARDS].push(idx);
+    }
     for (s, rows) in by_shard.iter().enumerate() {
-        if rows.is_empty() { continue; }
+        if rows.is_empty() {
+            continue;
+        }
         let _g = w_in.shards[s].lock().unwrap();
         for &idx in rows {
             unsafe {
                 let r = w_in.row_prefix(idx, dim);
-                for k in 0..dim { h[k] += r[k]; }
+                for k in 0..dim {
+                    h[k] += r[k];
+                }
             }
         }
     }
@@ -311,15 +341,23 @@ pub(crate) fn sgns_update_cbow_striped(
     }
     // Group writes by shard to reduce lock traffic
     let mut by_shard_w: [Vec<usize>; SHARDS] = std::array::from_fn(|_| Vec::new());
-    for &idx in context_indices { by_shard_w[idx % SHARDS].push(idx); }
+    for &idx in context_indices {
+        by_shard_w[idx % SHARDS].push(idx);
+    }
     for (s, rows) in by_shard_w.iter().enumerate() {
-        if rows.is_empty() { continue; }
+        if rows.is_empty() {
+            continue;
+        }
         let _g = w_in.shards[s].lock().unwrap();
         for &idx in rows {
             unsafe {
                 let r = w_in.row_prefix_mut(idx, dim);
                 for k in 0..dim {
-                    r[k] += if cbow_mean { neu1e[k] / c.max(1.0) } else { neu1e[k] };
+                    r[k] += if cbow_mean {
+                        neu1e[k] / c.max(1.0)
+                    } else {
+                        neu1e[k]
+                    };
                 }
             }
         }

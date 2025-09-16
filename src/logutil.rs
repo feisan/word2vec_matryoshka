@@ -54,4 +54,3 @@ pub fn log_info_msg(msg: &str) {
         }
     });
 }
-

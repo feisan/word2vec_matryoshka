@@ -54,7 +54,9 @@ impl KeyedVectors {
                 let np = PyModule::import_bound(py, "numpy")?;
                 let kwargs = PyDict::new_bound(py);
                 kwargs.set_item("mmap_mode", "r")?;
-                let arr = np.getattr("load")?.call((npy_path.as_str(),), Some(&kwargs))?;
+                let arr = np
+                    .getattr("load")?
+                    .call((npy_path.as_str(),), Some(&kwargs))?;
                 Ok(arr.into_py(py))
             })?;
             Ok(Self {
@@ -66,8 +68,9 @@ impl KeyedVectors {
                 memmap: Some(memmap),
             })
         } else {
-            let buf = std::fs::read(&npy_path)
-                .map_err(|e| PyValueError::new_err(format!("failed to read {}: {}", npy_path, e)))?;
+            let buf = std::fs::read(&npy_path).map_err(|e| {
+                PyValueError::new_err(format!("failed to read {}: {}", npy_path, e))
+            })?;
             let header_len = npy_header_len(&buf)?;
             let data_bytes = &buf[header_len..];
             let rows = vocab.len();
@@ -134,9 +137,9 @@ impl KeyedVectors {
             // Atomic temp files
             let vocab_tmp = format!("{}.tmp", &vocab_path);
             let npy_tmp = format!("{}.tmp", &npy_path);
-            std::fs::write(&vocab_tmp, serde_json::to_string(&self.vocab).unwrap()).map_err(|e| {
-                PyValueError::new_err(format!("failed to write {}: {}", vocab_tmp, e))
-            })?;
+            std::fs::write(&vocab_tmp, serde_json::to_string(&self.vocab).unwrap()).map_err(
+                |e| PyValueError::new_err(format!("failed to write {}: {}", vocab_tmp, e)),
+            )?;
             std::fs::copy(src, &npy_tmp)
                 .map_err(|e| PyValueError::new_err(format!("failed to copy npy: {}", e)))?;
             std::fs::rename(&vocab_tmp, &vocab_path).map_err(|e| {
@@ -168,25 +171,44 @@ impl KeyedVectors {
         if let Some(map) = &self.vectors {
             // Heavy O(n·d) loop: release the GIL
             let heap: Vec<(String, f32)> = py.allow_threads(|| {
-                let v = map
-                    .get(word)
-                    .expect("checked above");
+                let v = map.get(word).expect("checked above");
                 let v_slice = &v[..use_dim];
                 let mut na = 0.0f32;
-                for i in 0..use_dim { na += v_slice[i] * v_slice[i]; }
+                for i in 0..use_dim {
+                    na += v_slice[i] * v_slice[i];
+                }
                 let na_sqrt = if na > 0.0 { na.sqrt() } else { 0.0 };
                 let n = self.vocab.len();
                 let k = topn.min(n.saturating_sub(1));
                 let mut heap: Vec<(String, f32)> = Vec::with_capacity(k);
                 for (w, u) in map.iter() {
-                    if w == word { continue; }
-                    let mut dot = 0.0f32; let mut nb = 0.0f32;
-                    for i in 0..use_dim { let a = v_slice[i]; let b = u[i]; dot += a * b; nb += b * b; }
-                    let sim = if na_sqrt == 0.0 || nb == 0.0 { 0.0 } else { dot / (na_sqrt * nb.sqrt()) };
+                    if w == word {
+                        continue;
+                    }
+                    let mut dot = 0.0f32;
+                    let mut nb = 0.0f32;
+                    for i in 0..use_dim {
+                        let a = v_slice[i];
+                        let b = u[i];
+                        dot += a * b;
+                        nb += b * b;
+                    }
+                    let sim = if na_sqrt == 0.0 || nb == 0.0 {
+                        0.0
+                    } else {
+                        dot / (na_sqrt * nb.sqrt())
+                    };
                     if heap.len() < k {
                         heap.push((w.clone(), sim));
-                    } else if let Some(pos) = heap.iter().enumerate().min_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap()).map(|p| p.0) {
-                        if sim > heap[pos].1 { heap[pos] = (w.clone(), sim); }
+                    } else if let Some(pos) = heap
+                        .iter()
+                        .enumerate()
+                        .min_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap())
+                        .map(|p| p.0)
+                    {
+                        if sim > heap[pos].1 {
+                            heap[pos] = (w.clone(), sim);
+                        }
                     }
                 }
                 heap
@@ -224,23 +246,40 @@ impl KeyedVectors {
             }
             // Precompute query norm
             let mut na = 0.0f32;
-            for i in 0..dim { na += v_slice[i] * v_slice[i]; }
+            for i in 0..dim {
+                na += v_slice[i] * v_slice[i];
+            }
             let na_sqrt = if na > 0.0 { na.sqrt() } else { 0.0 };
             let mut heap: Vec<(usize, f32)> = Vec::with_capacity(topn.min(rows.saturating_sub(1)));
             for r in 0..rows {
-                if r == idx { continue; }
+                if r == idx {
+                    continue;
+                }
                 let uptr = unsafe { base_ptr.add(r * cols) };
-                let mut dot = 0.0f32; let mut nb = 0.0f32;
+                let mut dot = 0.0f32;
+                let mut nb = 0.0f32;
                 for i in 0..dim {
                     let a = v_slice[i];
                     let b = unsafe { std::ptr::read_unaligned(uptr.add(i)) };
-                    dot += a * b; nb += b * b;
+                    dot += a * b;
+                    nb += b * b;
                 }
-                let sim = if na_sqrt == 0.0 || nb == 0.0 { 0.0 } else { dot / (na_sqrt * nb.sqrt()) };
+                let sim = if na_sqrt == 0.0 || nb == 0.0 {
+                    0.0
+                } else {
+                    dot / (na_sqrt * nb.sqrt())
+                };
                 if heap.len() < topn {
                     heap.push((r, sim));
-                } else if let Some(pos) = heap.iter().enumerate().min_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap()).map(|p| p.0) {
-                    if sim > heap[pos].1 { heap[pos] = (r, sim); }
+                } else if let Some(pos) = heap
+                    .iter()
+                    .enumerate()
+                    .min_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap())
+                    .map(|p| p.0)
+                {
+                    if sim > heap[pos].1 {
+                        heap[pos] = (r, sim);
+                    }
                 }
             }
             heap
@@ -248,7 +287,10 @@ impl KeyedVectors {
         // Sort and map to tokens under the GIL again
         let mut heap = heap;
         heap.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        Ok(heap.into_iter().map(|(i, s)| (self.vocab[i].clone(), s)).collect())
+        Ok(heap
+            .into_iter()
+            .map(|(i, s)| (self.vocab[i].clone(), s))
+            .collect())
     }
 
     #[pyo3(signature = (key, level=None))]

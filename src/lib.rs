@@ -37,12 +37,12 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 mod io;
+mod kv;
+mod logutil;
 mod ops;
 mod sampling;
 mod training;
 mod weights;
-mod kv;
-mod logutil;
 use io::npy::{npy_header_len, read_npy_shape, write_npy};
 // cosine_prefix used only in earlier versions; current codepaths inline cosine
 use weights::SharedWeights;
@@ -67,7 +67,6 @@ struct KVSerde {
     vectors: HashMap<String, Vec<f32>>,
     vector_size: usize,
 }
-
 
 #[pyclass(module = "word2vec_matryoshka")]
 /// Trainable Word2Vec model supporting Matryoshka levels.
@@ -342,11 +341,12 @@ impl Word2Vec {
         let min_alpha = self.min_alpha;
         let neg = self.negative;
         let win = self.window;
-        let _full_dim = self.vector_size;
+        let vector_dim = self.vector_size;
         let vocab_len = self.ivocab.len();
         let levels_all = self.levels.clone();
         let sg_flag = self.sg;
         let hs_flag = self.hs;
+        let cbow_mean_flag = self.cbow_mean;
 
         let use_parallel = self._workers > 1;
         let interrupt = Arc::new(AtomicBool::new(false));
@@ -456,7 +456,7 @@ impl Word2Vec {
         }
         for e in 0..epochs {
             // Before starting a new epoch, honor any pending KeyboardInterrupt
-            Python::with_gil(|py| -> PyResult<()> { py.check_signals()?; Ok(()) })?;
+            Python::with_gil(|py| poll_keyboard_interrupt(py, &interrupt))?;
             if interrupt.load(Ordering::Relaxed) {
                 return Err(PyKeyboardInterrupt::new_err("training interrupted"));
             }
@@ -536,17 +536,13 @@ impl Word2Vec {
                         let tick = std::cmp::min(interval, Duration::from_millis(50));
                         let mut acc = Duration::from_millis(0);
                         loop {
-                            if stop_rep.load(Ordering::Relaxed) || interrupt_rep.load(Ordering::Relaxed) {
+                            if stop_rep.load(Ordering::Relaxed)
+                                || interrupt_rep.load(Ordering::Relaxed)
+                            {
                                 break;
                             }
                             std::thread::sleep(tick);
                             acc += tick;
-                            // also honor KeyboardInterrupt promptly from the reporter thread
-                            Python::with_gil(|py| {
-                                if py.check_signals().is_err() {
-                                    interrupt_rep.store(true, Ordering::Relaxed);
-                                }
-                            });
                             if acc >= interval {
                                 acc = Duration::from_millis(0);
                                 let now = Instant::now();
@@ -613,7 +609,6 @@ impl Word2Vec {
                 // Clone a new Py<PyAny> handle for the producer thread
                 let sentences_obj = Python::with_gil(|py| sentences_owned.clone_ref(py));
                 let vocab = self.vocab.clone();
-                let processed_arc = processed_opt.clone();
                 std::thread::spawn(move || {
                     // Larger batch size amortizes GIL and channel overhead
                     let chunk_cap: usize = std::env::var("W2V_CHUNK")
@@ -696,138 +691,186 @@ impl Word2Vec {
                                 continue;
                             }
                         };
-                        // Process this chunk without holding the GIL
-                        py.allow_threads(|| {
-                            chunk.par_iter().for_each(|sent| {
-                                // Use TLS RNG; borrow mutably for the scope of this sentence
-                                TLS_RNG.with(|cell| {
-                                    let mut state = cell.borrow_mut();
-                                    let epoch_now = SEED_EPOCH.load(Ordering::Relaxed);
-                                    if state.0 != epoch_now || state.1.is_none() {
-                                        let base = BASE_SEED.load(Ordering::Relaxed);
-                                        let tid_hash = {
-                                            use std::hash::{Hash, Hasher};
-                                            let mut h = std::collections::hash_map::DefaultHasher::new();
-                                            std::thread::current().id().hash(&mut h);
-                                            h.finish()
-                                        };
-                                        let mixed = base ^ tid_hash;
-                                        state.1 = Some(StdRng::seed_from_u64(mixed));
-                                        state.0 = epoch_now;
+                        // Process this chunk without holding the GIL and exit early on interrupt
+                        let processed_for_workers = processed_opt.clone();
+                        let interrupt_for_workers = interrupt.clone();
+                        let w_in_sw_worker = w_in_sw.clone();
+                        let w_out_sw_worker = w_out_sw.clone();
+                        let hs_codes_worker = hs_codes.clone();
+                        let hs_points_worker = hs_points.clone();
+                        let alias_prob_worker = alias_prob.clone();
+                        let alias_alias_worker = alias_alias.clone();
+                        let levels_worker = levels_ep.clone();
+                        let worker_aborted = py.allow_threads(|| {
+                            let interrupt_inner = interrupt_for_workers.clone();
+                            let processed_inner = processed_for_workers.clone();
+                            let w_in_inner = w_in_sw_worker.clone();
+                            let w_out_inner = w_out_sw_worker.clone();
+                            let hs_codes_inner = hs_codes_worker.clone();
+                            let hs_points_inner = hs_points_worker.clone();
+                            let alias_prob_inner = alias_prob_worker.clone();
+                            let alias_alias_inner = alias_alias_worker.clone();
+                            let levels_inner = levels_worker.clone();
+                            let level_norm = if levels_inner.is_empty() {
+                                1.0f32
+                            } else {
+                                levels_inner.len() as f32
+                            };
+                            chunk
+                                .par_iter()
+                                .try_for_each(move |sent| -> Result<(), ()> {
+                                    if interrupt_inner.load(Ordering::Relaxed) {
+                                        return Err(());
                                     }
-                                    let rng = state.1.as_mut().unwrap();
-                                    // Now do the work with rng
-                                    for (i, &center) in sent.iter().enumerate() {
-                                        let b = rng.gen_range(0..=win);
-                                        let start = i.saturating_sub(win - b);
-                                        let end = (i + win - b + 1).min(sent.len());
-                                        if sg_flag {
-                                            for j in start..end {
-                                                if j == i { continue; }
-                                                let context = sent[j];
-                                                if hs_flag {
-                                                    for &ldim in &levels_ep {
-                                                        crate::training::hs::hs_update_striped(
-                                                            &w_in_sw,
-                                                            &w_out_sw,
-                                                            center,
-                                                            &hs_codes[context],
-                                                            &hs_points[context],
-                                                            lr / (levels_ep.len() as f32),
-                                                            ldim,
-                                                        );
-                                                    }
-                                                } else if !alias_prob.is_empty() {
-                                                    crate::training::ns::sgns_update_levels_alias_striped_batched(
-                                                        &w_in_sw,
-                                                        &w_out_sw,
-                                                        center,
-                                                        context,
-                                                        neg,
-                                                        lr,
-                                                        &levels_ep,
-                                                        self.vector_size,
-                                                        &alias_prob,
-                                                        &alias_alias,
-                                                        rng,
-                                                    );
-                                                } else {
-                                                    crate::training::ns::sgns_update_levels_striped_batched(
-                                                        &w_in_sw,
-                                                        &w_out_sw,
-                                                        center,
-                                                        context,
-                                                        neg,
-                                                        lr,
-                                                        &levels_ep,
-                                                        self.vector_size,
-                                                        vocab_len,
-                                                        rng,
-                                                    );
-                                                }
+                                    let mut aborted = false;
+                                    TLS_RNG.with(|cell| {
+                                        let mut state = cell.borrow_mut();
+                                        let epoch_now = SEED_EPOCH.load(Ordering::Relaxed);
+                                        if state.0 != epoch_now || state.1.is_none() {
+                                            let base = BASE_SEED.load(Ordering::Relaxed);
+                                            let tid_hash = {
+                                                use std::hash::{Hash, Hasher};
+                                                let mut h = std::collections::hash_map::DefaultHasher::new();
+                                                std::thread::current().id().hash(&mut h);
+                                                h.finish()
+                                            };
+                                            let mixed = base ^ tid_hash;
+                                            state.1 = Some(StdRng::seed_from_u64(mixed));
+                                            state.0 = epoch_now;
+                                        }
+                                        let rng = state.1.as_mut().unwrap();
+                                        // Now do the work with rng
+                                        for (i, &center) in sent.iter().enumerate() {
+                                            if interrupt_inner.load(Ordering::Relaxed) {
+                                                aborted = true;
+                                                break;
                                             }
-                                        } else {
-                                            let mut ctx_indices: Vec<usize> = Vec::new();
-                                            for j in start..end { if j != i { ctx_indices.push(sent[j]); } }
-                                            if !ctx_indices.is_empty() {
-                                                if hs_flag {
-                                                    for &ldim in &levels_ep {
-                                                        crate::training::hs::hs_update_cbow_striped(
-                                                            &w_in_sw,
-                                                            &w_out_sw,
-                                                            &ctx_indices,
-                                                            &hs_codes[center],
-                                                            &hs_points[center],
-                                                            lr / (levels_ep.len() as f32),
-                                                            ldim,
-                                                            self.cbow_mean,
+                                            let b = rng.gen_range(0..=win);
+                                            let start = i.saturating_sub(win - b);
+                                            let end = (i + win - b + 1).min(sent.len());
+                                            if sg_flag {
+                                                for j in start..end {
+                                                    if j == i {
+                                                        continue;
+                                                    }
+                                                    let context = sent[j];
+                                                    if hs_flag {
+                                                        for &ldim in &levels_inner {
+                                                            crate::training::hs::hs_update_striped(
+                                                                &w_in_inner,
+                                                                &w_out_inner,
+                                                                center,
+                                                                &hs_codes_inner[context],
+                                                                &hs_points_inner[context],
+                                                                lr / level_norm,
+                                                                ldim,
+                                                            );
+                                                        }
+                                                    } else if !alias_prob_inner.is_empty() {
+                                                        crate::training::ns::sgns_update_levels_alias_striped_batched(
+                                                            &w_in_inner,
+                                                            &w_out_inner,
+                                                            center,
+                                                            context,
+                                                            neg,
+                                                            lr,
+                                                            &levels_inner,
+                                                            vector_dim,
+                                                            &alias_prob_inner,
+                                                            &alias_alias_inner,
+                                                            rng,
+                                                        );
+                                                    } else {
+                                                        crate::training::ns::sgns_update_levels_striped_batched(
+                                                            &w_in_inner,
+                                                            &w_out_inner,
+                                                            center,
+                                                            context,
+                                                            neg,
+                                                            lr,
+                                                            &levels_inner,
+                                                            vector_dim,
+                                                            vocab_len,
+                                                            rng,
                                                         );
                                                     }
-                                                } else {
-                                                    for &ldim in &levels_ep {
-                                                        if !alias_prob.is_empty() {
-                                                            crate::training::ns::sgns_update_cbow_alias_striped(
-                                                                &w_in_sw,
-                                                                &w_out_sw,
+                                                }
+                                            } else {
+                                                let mut ctx_indices: Vec<usize> = Vec::new();
+                                                for j in start..end {
+                                                    if j != i {
+                                                        ctx_indices.push(sent[j]);
+                                                    }
+                                                }
+                                                if !ctx_indices.is_empty() {
+                                                    if hs_flag {
+                                                        for &ldim in &levels_inner {
+                                                            crate::training::hs::hs_update_cbow_striped(
+                                                                &w_in_inner,
+                                                                &w_out_inner,
                                                                 &ctx_indices,
-                                                                center,
-                                                                neg,
-                                                                lr / (levels_ep.len() as f32),
+                                                                &hs_codes_inner[center],
+                                                                &hs_points_inner[center],
+                                                                lr / level_norm,
                                                                 ldim,
-                                                                &alias_prob,
-                                                                &alias_alias,
-                                                                rng,
-                                                                self.cbow_mean,
+                                                                cbow_mean_flag,
                                                             );
-                                                        } else {
-                                                            crate::training::ns::sgns_update_cbow_striped(
-                                                                &w_in_sw,
-                                                                &w_out_sw,
-                                                                &ctx_indices,
-                                                                center,
-                                                                neg,
-                                                                lr / (levels_ep.len() as f32),
-                                                                ldim,
-                                                                vocab_len,
-                                                                rng,
-                                                                self.cbow_mean,
-                                                            );
+                                                        }
+                                                    } else {
+                                                        for &ldim in &levels_inner {
+                                                            if !alias_prob_inner.is_empty() {
+                                                                crate::training::ns::sgns_update_cbow_alias_striped(
+                                                                    &w_in_inner,
+                                                                    &w_out_inner,
+                                                                    &ctx_indices,
+                                                                    center,
+                                                                    neg,
+                                                                    lr / level_norm,
+                                                                    ldim,
+                                                                    &alias_prob_inner,
+                                                                    &alias_alias_inner,
+                                                                    rng,
+                                                                    cbow_mean_flag,
+                                                                );
+                                                            } else {
+                                                                crate::training::ns::sgns_update_cbow_striped(
+                                                                    &w_in_inner,
+                                                                    &w_out_inner,
+                                                                    &ctx_indices,
+                                                                    center,
+                                                                    neg,
+                                                                    lr / level_norm,
+                                                                    ldim,
+                                                                    vocab_len,
+                                                                    rng,
+                                                                    cbow_mean_flag,
+                                                                );
+                                                            }
                                                         }
                                                     }
                                                 }
                                             }
                                         }
+                                    });
+                                    if aborted {
+                                        return Err(());
                                     }
-                                    if let Some(ref proc) = processed_arc {
+                                    if let Some(ref proc) = processed_inner {
                                         proc.fetch_add(sent.len() as u64, Ordering::Relaxed);
                                     }
-                                });
-                            });
+                                    if interrupt_inner.load(Ordering::Relaxed) {
+                                        return Err(());
+                                    }
+                                    Ok(())
+                                })
+                                .is_err()
                         });
-                        // Propagate KeyboardInterrupt after each chunk and set shared flag
-                        if let Err(e) = py.check_signals() {
+                        if worker_aborted {
                             interrupt.store(true, Ordering::Relaxed);
-                            return Err(e);
+                        }
+                        Python::with_gil(|py| poll_keyboard_interrupt(py, &interrupt))?;
+                        if interrupt.load(Ordering::Relaxed) {
+                            return Err(PyKeyboardInterrupt::new_err("training interrupted"));
                         }
                     }
                     Ok(())
@@ -845,8 +888,7 @@ impl Word2Vec {
                 }
                 // Catch any pending signals which may have arrived between the last
                 // chunk and loop exit (e.g., right at epoch boundary)
-                if let Err(e) = Python::with_gil(|py| -> PyResult<()> { py.check_signals()?; Ok(()) }) {
-                    interrupt.store(true, Ordering::Relaxed);
+                if let Err(e) = Python::with_gil(|py| poll_keyboard_interrupt(py, &interrupt)) {
                     return Err(e);
                 }
                 if interrupt.load(Ordering::Relaxed) {
@@ -921,7 +963,9 @@ impl Word2Vec {
                                     let end = (i + win - b + 1).min(sent_idx.len());
                                     if sg_flag {
                                         for j in start..end {
-                                            if j == i { continue; }
+                                            if j == i {
+                                                continue;
+                                            }
                                             let context = sent_idx[j];
                                             if hs_flag {
                                                 for &ldim in &levels_all {
@@ -966,7 +1010,11 @@ impl Word2Vec {
                                         }
                                     } else {
                                         ctx_indices.clear();
-                                        for j in start..end { if j != i { ctx_indices.push(sent_idx[j]); } }
+                                        for j in start..end {
+                                            if j != i {
+                                                ctx_indices.push(sent_idx[j]);
+                                            }
+                                        }
                                         if !ctx_indices.is_empty() {
                                             if hs_flag {
                                                 for &ldim in &levels_all {
@@ -1025,11 +1073,22 @@ impl Word2Vec {
                                 last = now;
                                 let done = base_done + processed_epoch;
                                 if verbose_flag {
-                                    let frac = if total_all > 0 { (done as f64) / (total_all as f64) } else { 0.0 };
+                                    let frac = if total_all > 0 {
+                                        (done as f64) / (total_all as f64)
+                                    } else {
+                                        0.0
+                                    };
                                     let elapsed = now.duration_since(t0).as_secs_f64();
-                                    let rate = if elapsed > 0.0 { (done as f64) / elapsed } else { 0.0 };
-                                    let mut alpha = lr0 - (lr0 - min_alpha) * (done as f32) / (total_all as f32);
-                                    if alpha < min_alpha { alpha = min_alpha; }
+                                    let rate = if elapsed > 0.0 {
+                                        (done as f64) / elapsed
+                                    } else {
+                                        0.0
+                                    };
+                                    let mut alpha = lr0
+                                        - (lr0 - min_alpha) * (done as f32) / (total_all as f32);
+                                    if alpha < min_alpha {
+                                        alpha = min_alpha;
+                                    }
                                     let msg = format!(
                                         "EPOCH {}/{}: PROGRESS at {:.2}% tokens, alpha {:.5}, {} tokens/s",
                                         e + 1, epochs, frac * 100.0, alpha, rate.round() as u64
@@ -1042,8 +1101,7 @@ impl Word2Vec {
                                 }
                             }
                             // Propagate KeyboardInterrupt promptly and set shared flag
-                            if let Err(e) = py.check_signals() {
-                                interrupt.store(true, Ordering::Relaxed);
+                            if let Err(e) = poll_keyboard_interrupt(py, &interrupt) {
                                 return Err(e);
                             }
                         } else {
@@ -1057,52 +1115,100 @@ impl Word2Vec {
                                     let end = (i + win - b + 1).min(sent_idx.len());
                                     if sg_flag {
                                         for j in start..end {
-                                            if j == i { continue; }
+                                            if j == i {
+                                                continue;
+                                            }
                                             let context = sent_idx[j];
                                             if hs_flag {
                                                 for &ldim in &levels_all {
                                                     crate::training::hs::hs_update(
-                                                        &mut self.w_in, &mut self.w_out, center,
-                                                        &self.hs_codes[context], &self.hs_points[context],
-                                                        lr / (levels_all.len() as f32), ldim,
+                                                        &mut self.w_in,
+                                                        &mut self.w_out,
+                                                        center,
+                                                        &self.hs_codes[context],
+                                                        &self.hs_points[context],
+                                                        lr / (levels_all.len() as f32),
+                                                        ldim,
                                                     );
                                                 }
                                             } else if !self.alias_prob.is_empty() {
                                                 crate::training::ns::sgns_update_levels_alias(
-                                                    &mut self.w_in, &mut self.w_out, center, context,
-                                                    neg, lr, &levels_all, self.vector_size,
-                                                    &self.alias_prob, &self.alias_alias, &mut rng,
+                                                    &mut self.w_in,
+                                                    &mut self.w_out,
+                                                    center,
+                                                    context,
+                                                    neg,
+                                                    lr,
+                                                    &levels_all,
+                                                    self.vector_size,
+                                                    &self.alias_prob,
+                                                    &self.alias_alias,
+                                                    &mut rng,
                                                 );
                                             } else {
                                                 crate::training::ns::sgns_update_levels(
-                                                    &mut self.w_in, &mut self.w_out, center, context,
-                                                    neg, lr, &levels_all, self.vector_size, vocab_len, &mut rng,
+                                                    &mut self.w_in,
+                                                    &mut self.w_out,
+                                                    center,
+                                                    context,
+                                                    neg,
+                                                    lr,
+                                                    &levels_all,
+                                                    self.vector_size,
+                                                    vocab_len,
+                                                    &mut rng,
                                                 );
                                             }
                                         }
                                     } else {
                                         ctx_indices.clear();
-                                        for j in start..end { if j != i { ctx_indices.push(sent_idx[j]); } }
+                                        for j in start..end {
+                                            if j != i {
+                                                ctx_indices.push(sent_idx[j]);
+                                            }
+                                        }
                                         if !ctx_indices.is_empty() {
                                             if hs_flag {
                                                 for &ldim in &levels_all {
                                                     crate::training::hs::hs_update_cbow(
-                                                        &mut self.w_in, &mut self.w_out, &ctx_indices, &self.hs_codes[center],
-                                                        &self.hs_points[center], lr / (levels_all.len() as f32), ldim, self.cbow_mean,
+                                                        &mut self.w_in,
+                                                        &mut self.w_out,
+                                                        &ctx_indices,
+                                                        &self.hs_codes[center],
+                                                        &self.hs_points[center],
+                                                        lr / (levels_all.len() as f32),
+                                                        ldim,
+                                                        self.cbow_mean,
                                                     );
                                                 }
                                             } else {
                                                 for &ldim in &levels_all {
                                                     if !self.alias_prob.is_empty() {
                                                         crate::training::ns::sgns_update_cbow_alias(
-                                                            &mut self.w_in, &mut self.w_out, &ctx_indices, center, neg,
-                                                            lr / (levels_all.len() as f32), ldim,
-                                                            &self.alias_prob, &self.alias_alias, &mut rng, self.cbow_mean,
+                                                            &mut self.w_in,
+                                                            &mut self.w_out,
+                                                            &ctx_indices,
+                                                            center,
+                                                            neg,
+                                                            lr / (levels_all.len() as f32),
+                                                            ldim,
+                                                            &self.alias_prob,
+                                                            &self.alias_alias,
+                                                            &mut rng,
+                                                            self.cbow_mean,
                                                         );
                                                     } else {
                                                         crate::training::ns::sgns_update_cbow(
-                                                            &mut self.w_in, &mut self.w_out, &ctx_indices, center, neg,
-                                                            lr / (levels_all.len() as f32), ldim, vocab_len, &mut rng, self.cbow_mean,
+                                                            &mut self.w_in,
+                                                            &mut self.w_out,
+                                                            &ctx_indices,
+                                                            center,
+                                                            neg,
+                                                            lr / (levels_all.len() as f32),
+                                                            ldim,
+                                                            vocab_len,
+                                                            &mut rng,
+                                                            self.cbow_mean,
                                                         );
                                                     }
                                                 }
@@ -1113,8 +1219,7 @@ impl Word2Vec {
                             });
                             processed_epoch += sent_idx.len() as u64;
                             // Propagate KeyboardInterrupt promptly and set shared flag
-                            if let Err(e) = py.check_signals() {
-                                interrupt.store(true, Ordering::Relaxed);
+                            if let Err(e) = poll_keyboard_interrupt(py, &interrupt) {
                                 return Err(e);
                             }
                         }
@@ -1152,8 +1257,7 @@ impl Word2Vec {
                     Ok(())
                 })?;
                 // Catch any pending signals at epoch end before continuing
-                if let Err(e) = Python::with_gil(|py| -> PyResult<()> { py.check_signals()?; Ok(()) }) {
-                    interrupt.store(true, Ordering::Relaxed);
+                if let Err(e) = Python::with_gil(|py| poll_keyboard_interrupt(py, &interrupt)) {
                     return Err(e);
                 }
                 if interrupt.load(Ordering::Relaxed) {
@@ -1330,6 +1434,15 @@ fn random_unit(dim: usize) -> Vec<f32> {
         }
     }
     v
+}
+
+fn poll_keyboard_interrupt(py: Python<'_>, interrupt: &Arc<AtomicBool>) -> PyResult<()> {
+    if let Err(err) = py.check_signals() {
+        interrupt.store(true, Ordering::Relaxed);
+        Err(err)
+    } else {
+        Ok(())
+    }
 }
 
 // Math kernels and TLS buffers moved to ops module

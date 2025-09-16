@@ -97,13 +97,21 @@ pub fn dot_prefix(a: &[f32], b: &[f32], dim: usize) -> f32 {
 #[inline]
 #[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[inline(always)]
-unsafe fn accumulate_levels_x86(a: &[f32], b: &[f32], start: usize, end: usize, head_dot: &mut f32, head_na: &mut f32, head_nb: &mut f32) {
+unsafe fn accumulate_levels_x86(
+    a: &[f32],
+    b: &[f32],
+    start: usize,
+    end: usize,
+    head_dot: &mut f32,
+    head_na: &mut f32,
+    head_nb: &mut f32,
+) {
     use std::arch::x86_64::*;
     let mut i = start;
     let mut vdot = _mm256_setzero_ps();
     let mut vna = _mm256_setzero_ps();
     let mut vnb = _mm256_setzero_ps();
-    
+
     while i + 8 <= end {
         let va = _mm256_loadu_ps(a.as_ptr().add(i));
         let vb = _mm256_loadu_ps(b.as_ptr().add(i));
@@ -112,12 +120,12 @@ unsafe fn accumulate_levels_x86(a: &[f32], b: &[f32], start: usize, end: usize, 
         vnb = _mm256_fmadd_ps(vb, vb, vnb);
         i += 8;
     }
-    
+
     // Horizontal sum
     let dot_sum = _mm256_reduce_add_ps(vdot);
     let na_sum = _mm256_reduce_add_ps(vna);
     let nb_sum = _mm256_reduce_add_ps(vnb);
-    
+
     // Add remaining elements
     while i < end {
         let a_val = *a.get_unchecked(i);
@@ -127,18 +135,25 @@ unsafe fn accumulate_levels_x86(a: &[f32], b: &[f32], start: usize, end: usize, 
         *head_nb += b_val * b_val;
         i += 1;
     }
-    
 }
 
 #[cfg(all(feature = "simd", target_arch = "aarch64"))]
 #[inline(always)]
-unsafe fn accumulate_levels_aarch64(a: &[f32], b: &[f32], start: usize, end: usize, head_dot: &mut f32, head_na: &mut f32, head_nb: &mut f32) {
+unsafe fn accumulate_levels_aarch64(
+    a: &[f32],
+    b: &[f32],
+    start: usize,
+    end: usize,
+    head_dot: &mut f32,
+    head_na: &mut f32,
+    head_nb: &mut f32,
+) {
     use std::arch::aarch64::*;
     let mut i = start;
     let mut vdot = vdupq_n_f32(0.0);
     let mut vna = vdupq_n_f32(0.0);
     let mut vnb = vdupq_n_f32(0.0);
-    
+
     while i + 4 <= end {
         let va = vld1q_f32(a.as_ptr().add(i));
         let vb = vld1q_f32(b.as_ptr().add(i));
@@ -147,12 +162,12 @@ unsafe fn accumulate_levels_aarch64(a: &[f32], b: &[f32], start: usize, end: usi
         vnb = vmlaq_f32(vnb, vb, vb);
         i += 4;
     }
-    
+
     // Horizontal sum
     let dot_sum = vaddvq_f32(vdot);
     let na_sum = vaddvq_f32(vna);
     let nb_sum = vaddvq_f32(vnb);
-    
+
     // Add remaining elements
     while i < end {
         let a_val = *a.get_unchecked(i);
@@ -162,10 +177,17 @@ unsafe fn accumulate_levels_aarch64(a: &[f32], b: &[f32], start: usize, end: usi
         *head_nb += b_val * b_val;
         i += 1;
     }
-    
 }
 
-pub fn accumulate_levels(a: &[f32], b: &[f32], start: usize, end: usize, head_dot: &mut f32, head_na: &mut f32, head_nb: &mut f32) {
+pub fn accumulate_levels(
+    a: &[f32],
+    b: &[f32],
+    start: usize,
+    end: usize,
+    head_dot: &mut f32,
+    head_na: &mut f32,
+    head_nb: &mut f32,
+) {
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     {
         unsafe {

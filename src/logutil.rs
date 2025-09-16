@@ -1,3 +1,4 @@
+use pyo3::exceptions::PyKeyboardInterrupt;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,50 +8,41 @@ pub static LOGGING_READY: AtomicBool = AtomicBool::new(false);
 
 /// Ensure the module logger is configured and emit an INFO message.
 ///
-/// Safe to call from any thread; acquires the GIL internally.
-pub fn log_info_msg(msg: &str) {
-    Python::with_gil(|py| {
-        if let Ok(logging) = PyModule::import_bound(py, "logging") {
-            // Lazy logger initialization
-            if !LOGGING_READY.swap(true, Ordering::Relaxed) {
-                if let Ok(logger0) = logging
-                    .getattr("getLogger")
-                    .and_then(|f| f.call1(("word2vec_matryoshka",)))
-                {
-                    if let Ok(handlers) = logger0.getattr("handlers") {
-                        let len: usize = handlers
-                            .getattr("__len__")
-                            .and_then(|l| l.call0())
-                            .and_then(|v| v.extract())
-                            .unwrap_or(0);
-                        if len == 0 {
-                            if let (Ok(sh), Ok(fmtmod)) = (
-                                logging.getattr("StreamHandler").and_then(|c| c.call0()),
-                                logging.getattr("Formatter"),
-                            ) {
-                                if let Ok(fmt) = fmtmod.call1((
-                                    "%(asctime)s: %(levelname)s: %(message)s",
-                                    "%Y-%m-%d %H:%M:%S",
-                                )) {
-                                    let _ = sh.call_method1("setFormatter", (fmt,));
-                                }
-                                let _ = logger0.call_method1("addHandler", (sh,));
-                                if let Ok(info) = logging.getattr("INFO") {
-                                    let _ = logger0.call_method1("setLevel", (info,));
-                                }
-                                // allow propagation so external handlers (e.g., pytest caplog) can capture
-                                let _ = logger0.setattr("propagate", true);
-                            }
-                        }
-                    }
-                }
-            }
-            if let Ok(logger) = logging
-                .getattr("getLogger")
-                .and_then(|f| f.call1(("word2vec_matryoshka",)))
-            {
-                let _ = logger.call_method1("info", (msg.to_string(),));
+/// Safe to call from any thread; acquires the GIL internally. Returns an
+/// error if logging raised (notably propagating `KeyboardInterrupt`).
+pub fn log_info_msg(msg: &str) -> PyResult<()> {
+    Python::with_gil(|py| -> PyResult<()> {
+        let logging = PyModule::import_bound(py, "logging")?;
+        let get_logger = logging.getattr("getLogger")?;
+        let logger = get_logger.call1(("word2vec_matryoshka",))?;
+        if !LOGGING_READY.swap(true, Ordering::Relaxed) {
+            let handlers = logger.getattr("handlers")?;
+            let len: usize = handlers.getattr("__len__")?.call0()?.extract()?;
+            if len == 0 {
+                let sh = logging.getattr("StreamHandler")?.call0()?;
+                let fmtmod = logging.getattr("Formatter")?;
+                let fmt = fmtmod.call1((
+                    "%(asctime)s: %(levelname)s: %(message)s",
+                    "%Y-%m-%d %H:%M:%S",
+                ))?;
+                sh.call_method1("setFormatter", (fmt,))?;
+                logger.call_method1("addHandler", (sh,))?;
+                let info = logging.getattr("INFO")?;
+                logger.call_method1("setLevel", (info,))?;
+                logger.setattr("propagate", true)?;
             }
         }
-    });
+        logger.call_method1("info", (msg.to_string(),))?;
+        Ok(())
+    })
+    .or_else(|err| {
+        Python::with_gil(|py| {
+            if err.is_instance_of::<PyKeyboardInterrupt>(py) {
+                Err(err)
+            } else {
+                err.print(py);
+                Ok(())
+            }
+        })
+    })
 }

@@ -60,6 +60,8 @@ thread_local! {
     static TLS_RNG: RefCell<(u64, Option<StdRng>)> = const { RefCell::new((0, None)) };
 }
 
+const INTERRUPT_POLL_INTERVAL: usize = 1024; // check for KeyboardInterrupt roughly every 1024 centers
+
 // SharedWeights moved to weights module
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -307,7 +309,7 @@ impl Word2Vec {
                     "TRAIN setup: built Huffman tree (vocab={}, nodes={})",
                     n,
                     2 * n - 1
-                ));
+                ))?;
             }
         }
         // Prepare alias sampler for NS
@@ -331,7 +333,7 @@ impl Word2Vec {
                     "TRAIN setup: built alias table for negative sampling (vocab={}, negatives={})",
                     self.ivocab.len(),
                     self.negative
-                ));
+                ))?;
             }
         }
 
@@ -379,7 +381,7 @@ impl Word2Vec {
                 self.alpha,
                 self.min_alpha,
                 self.log_interval
-            ));
+            ))?;
             // Hardware / thread-pool info
             let cores = std::thread::available_parallelism()
                 .map(|n| n.get())
@@ -388,7 +390,7 @@ impl Word2Vec {
             log_info_msg(&format!(
                 "TRAIN setup: hardware cores={}, rayon_threads={}, workers={}",
                 cores, rayon_threads, self._workers
-            ));
+            ))?;
             // Environment info: PID, Python version, arch + SIMD
             let pid = std::process::id();
             let mut py_ver = String::from("unknown");
@@ -433,11 +435,11 @@ impl Word2Vec {
             log_info_msg(&format!(
                 "TRAIN setup: env pid={}, py={}, arch={}, simd_feature={}, simd_runtime={}",
                 pid, py_ver, arch, simd_feature, simd_runtime
-            ));
+            ))?;
             log_info_msg(&format!(
                 "TRAIN setup: total_tokens_per_epoch={}, epochs={}",
                 total_per_epoch, epochs
-            ));
+            ))?;
         }
         let _ = total_examples; // reserved for future
 
@@ -494,7 +496,7 @@ impl Word2Vec {
                     neg,
                     levels_all,
                     self._workers
-                ));
+                ))?;
             }
             // Emit an initial 0.00% line at epoch start when logging
             if want_progress && verbose_flag {
@@ -508,7 +510,7 @@ impl Word2Vec {
                     alpha0,
                     0u64
                 );
-                log_info_msg(&msg);
+                log_info_msg(&msg)?;
             }
             if use_parallel {
                 // Parallel path with striped locks
@@ -575,7 +577,16 @@ impl Word2Vec {
                                         alpha,
                                         rate.round() as u64
                                     );
-                                    log_info_msg(&msg);
+                                    if let Err(err) = log_info_msg(&msg) {
+                                        Python::with_gil(|py| {
+                                            if err.is_instance_of::<PyKeyboardInterrupt>(py) {
+                                                interrupt_rep.store(true, Ordering::Relaxed);
+                                            } else {
+                                                err.print(py);
+                                            }
+                                        });
+                                        break;
+                                    }
                                 }
                                 if let Some(cb) = &progress_rep {
                                     Python::with_gil(|py| {
@@ -716,6 +727,7 @@ impl Word2Vec {
                             } else {
                                 levels_inner.len() as f32
                             };
+                            let mask = INTERRUPT_POLL_INTERVAL.saturating_sub(1);
                             chunk
                                 .par_iter()
                                 .try_for_each(move |sent| -> Result<(), ()> {
@@ -744,6 +756,15 @@ impl Word2Vec {
                                             if interrupt_inner.load(Ordering::Relaxed) {
                                                 aborted = true;
                                                 break;
+                                            }
+                                            if mask == 0 || (i & mask) == 0 {
+                                                let signaled =
+                                                    Python::with_gil(|py| py.check_signals().is_err());
+                                                if signaled {
+                                                    interrupt_inner.store(true, Ordering::Relaxed);
+                                                    aborted = true;
+                                                    break;
+                                                }
                                             }
                                             let b = rng.gen_range(0..=win);
                                             let start = i.saturating_sub(win - b);
@@ -922,7 +943,7 @@ impl Word2Vec {
                         tokens_epoch,
                         wps,
                         alpha_end
-                    ));
+                    ))?;
                 }
             } else {
                 // Sequential deterministic streaming path
@@ -953,11 +974,25 @@ impl Word2Vec {
                         // compute step moved below under py.allow_threads
                         if want_progress {
                             // Training compute without the GIL; count processed centers
-                            let tokens_done = py.allow_threads(|| {
+                            let mask = INTERRUPT_POLL_INTERVAL.saturating_sub(1);
+                            let tokens_done_res: Result<u64, ()> = py.allow_threads(|| {
                                 let mut processed = 0u64;
-                                // Reuse a single context buffer across centers
                                 let mut ctx_indices: Vec<usize> = Vec::with_capacity(2 * win + 1);
+                                let mut interrupted_local = false;
                                 for (i, &center) in sent_idx.iter().enumerate() {
+                                    if interrupt.load(Ordering::Relaxed) {
+                                        interrupted_local = true;
+                                        break;
+                                    }
+                                    if mask == 0 || ((processed as usize) & mask) == 0 {
+                                        let signaled =
+                                            Python::with_gil(|py| py.check_signals().is_err());
+                                        if signaled {
+                                            interrupt.store(true, Ordering::Relaxed);
+                                            interrupted_local = true;
+                                            break;
+                                        }
+                                    }
                                     let b = rng.gen_range(0..=win);
                                     let start = i.saturating_sub(win - b);
                                     let end = (i + win - b + 1).min(sent_idx.len());
@@ -1065,8 +1100,21 @@ impl Word2Vec {
                                     }
                                     processed += 1;
                                 }
-                                processed
+                                if interrupted_local {
+                                    Err(())
+                                } else {
+                                    Ok(processed)
+                                }
                             });
+                            let tokens_done = match tokens_done_res {
+                                Ok(val) => val,
+                                Err(_) => {
+                                    interrupt.store(true, Ordering::Relaxed);
+                                    return Err(PyKeyboardInterrupt::new_err(
+                                        "training interrupted",
+                                    ));
+                                }
+                            };
                             processed_epoch += tokens_done;
                             let now = Instant::now();
                             if now.duration_since(last).as_secs_f64() >= interval {
@@ -1093,7 +1141,7 @@ impl Word2Vec {
                                         "EPOCH {}/{}: PROGRESS at {:.2}% tokens, alpha {:.5}, {} tokens/s",
                                         e + 1, epochs, frac * 100.0, alpha, rate.round() as u64
                                     );
-                                    log_info_msg(&msg);
+                                    log_info_msg(&msg)?;
                                 }
                                 if let Some(cb) = &progress_cb {
                                     let bound = cb.bind(py);
@@ -1106,10 +1154,21 @@ impl Word2Vec {
                             }
                         } else {
                             // No progress requested: still compute without the GIL
-                            let _ = py.allow_threads(|| {
-                                // Reuse a single context buffer across centers
+                            let mask = INTERRUPT_POLL_INTERVAL.saturating_sub(1);
+                            let res: Result<(), ()> = py.allow_threads(|| {
                                 let mut ctx_indices: Vec<usize> = Vec::with_capacity(2 * win + 1);
                                 for (i, &center) in sent_idx.iter().enumerate() {
+                                    if interrupt.load(Ordering::Relaxed) {
+                                        return Err(());
+                                    }
+                                    if mask == 0 || (i & mask) == 0 {
+                                        let signaled =
+                                            Python::with_gil(|py| py.check_signals().is_err());
+                                        if signaled {
+                                            interrupt.store(true, Ordering::Relaxed);
+                                            return Err(());
+                                        }
+                                    }
                                     let b = rng.gen_range(0..=win);
                                     let start = i.saturating_sub(win - b);
                                     let end = (i + win - b + 1).min(sent_idx.len());
@@ -1216,9 +1275,13 @@ impl Word2Vec {
                                         }
                                     }
                                 }
+                                Ok(())
                             });
+                            if res.is_err() {
+                                interrupt.store(true, Ordering::Relaxed);
+                                return Err(PyKeyboardInterrupt::new_err("training interrupted"));
+                            }
                             processed_epoch += sent_idx.len() as u64;
-                            // Propagate KeyboardInterrupt promptly and set shared flag
                             if let Err(e) = poll_keyboard_interrupt(py, &interrupt) {
                                 return Err(e);
                             }
@@ -1252,7 +1315,7 @@ impl Word2Vec {
                             alpha,
                             rate.round() as u64
                         );
-                        log_info_msg(&msg);
+                        log_info_msg(&msg)?;
                     }
                     Ok(())
                 })?;

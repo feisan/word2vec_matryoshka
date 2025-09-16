@@ -1118,14 +1118,18 @@ impl Word2Vec {
 
     #[getter]
     fn wv<'py>(&self, py: Python<'py>) -> PyResult<Py<KeyedVectors>> {
-        let mut map = HashMap::default();
-        let mut vocab = Vec::with_capacity(self.ivocab.len());
-        let mut index = HashMap::default();
-        for (idx, w) in self.ivocab.iter().enumerate() {
-            vocab.push(w.clone());
-            index.insert(w.clone(), idx);
-            map.insert(w.clone(), self.get_in_vec(idx).to_vec());
-        }
+        // Build the KeyedVectors payload without holding the GIL
+        let (map, vocab, index) = py.allow_threads(|| {
+            let mut map = HashMap::default();
+            let mut vocab = Vec::with_capacity(self.ivocab.len());
+            let mut index = HashMap::default();
+            for (idx, w) in self.ivocab.iter().enumerate() {
+                vocab.push(w.clone());
+                index.insert(w.clone(), idx);
+                map.insert(w.clone(), self.get_in_vec(idx).to_vec());
+            }
+            (map, vocab, index)
+        });
         let kv = KeyedVectors {
             vectors: Some(map),
             vector_size: self.vector_size,

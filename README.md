@@ -1,5 +1,7 @@
 # word2vec‑matryoshka
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/feisan/word2vec_matryoshka)
+
 Lightweight Word2Vec for Python, backed by Rust (PyO3). It implements a small, practical subset of Word2Vec (Skip‑gram/CBOW with Negative Sampling or Hierarchical Softmax) and adds Matryoshka multi‑level representations: you can train on multiple prefix dimensions and query a prefix level without recomputing vectors.
 
 This project is a learning/practice (“vibe coding”) effort inspired by gensim. It intentionally covers only a tiny part of gensim’s functionality and adds Matryoshka prefix representations. If you need a full‑featured Word2Vec, please try gensim first.

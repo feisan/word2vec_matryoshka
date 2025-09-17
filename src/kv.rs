@@ -47,7 +47,15 @@ impl KeyedVectors {
             index.insert(w.clone(), i);
         }
 
-        let (_rows, cols) = read_npy_shape(&npy_path)?;
+        // Read npy header shape and validate rows against vocab size first
+        let (rows_on_disk, cols) = read_npy_shape(&npy_path)?;
+        if rows_on_disk != vocab.len() {
+            return Err(PyValueError::new_err(format!(
+                "npy shape mismatch: rows={} != vocab={}",
+                rows_on_disk,
+                vocab.len()
+            )));
+        }
 
         if mmap == Some("r") {
             let memmap = Python::with_gil(|py| -> PyResult<Py<PyAny>> {
@@ -68,24 +76,34 @@ impl KeyedVectors {
                 memmap: Some(memmap),
             })
         } else {
-            let buf = std::fs::read(&npy_path).map_err(|e| {
-                PyValueError::new_err(format!("failed to read {}: {}", npy_path, e))
-            })?;
-            let header_len = npy_header_len(&buf)?;
-            let data_bytes = &buf[header_len..];
-            let rows = vocab.len();
-            let mut vectors: HashMap<String, Vec<f32>> = HashMap::default();
-            let mut offset = 0usize;
-            for i in 0..rows {
-                let mut row = vec![0f32; cols];
-                let bytes = &data_bytes[offset..offset + cols * 4];
-                for j in 0..cols {
-                    let start = j * 4;
-                    row[j] = f32::from_le_bytes(bytes[start..start + 4].try_into().unwrap());
+            // Robust path: use numpy to load the array fully, then copy into Rust vectors
+            let (rows, vectors): (usize, HashMap<String, Vec<f32>>) = Python::with_gil(|py| {
+                let np = PyModule::import_bound(py, "numpy")?;
+                let arr_obj = np.getattr("load")?.call1((npy_path.as_str(),))?;
+                let arr: Bound<PyArray2<f32>> = arr_obj.downcast_into()?;
+                let shape = arr.shape();
+                let rows = shape[0];
+                let cols_py = shape[1];
+                if cols_py != cols {
+                    return Err(PyValueError::new_err("npy shape mismatch: inconsistent cols"));
                 }
-                vectors.insert(vocab[i].clone(), row);
-                offset += cols * 4;
-            }
+                if rows != vocab.len() {
+                    return Err(PyValueError::new_err(format!(
+                        "npy shape mismatch: rows={} != vocab={}",
+                        rows,
+                        vocab.len()
+                    )));
+                }
+                let mut map: HashMap<String, Vec<f32>> = HashMap::default();
+                for i in 0..rows {
+                    let row_obj = arr.get_item(i)?;
+                    let row: Bound<PyArray1<f32>> = row_obj.downcast_into()?;
+                    let v: Vec<f32> = row.to_vec()?;
+                    map.insert(vocab[i].clone(), v);
+                }
+                Ok::<_, PyErr>((rows, map))
+            })?;
+
             Ok(Self {
                 vectors: Some(vectors),
                 vector_size: cols,
@@ -167,11 +185,18 @@ impl KeyedVectors {
         if use_dim == 0 || topn == 0 {
             return Ok(Vec::new());
         }
+        // Validate that the query word exists in vocab for consistent error behavior
+        if !self.index.contains_key(word) {
+            return Err(PyKeyError::new_err(format!(
+                "word '{}' not in vocab",
+                word
+            )));
+        }
         // In-memory fast path
         if let Some(map) = &self.vectors {
             // Heavy O(n·d) loop: release the GIL
             let heap: Vec<(String, f32)> = py.allow_threads(|| {
-                let v = map.get(word).expect("checked above");
+                let v = map.get(word).expect("validated by index.contains_key");
                 let v_slice = &v[..use_dim];
                 let mut na = 0.0f32;
                 for i in 0..use_dim {

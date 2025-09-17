@@ -193,20 +193,33 @@ impl Word2Vec {
         for (i, w) in ivocab.iter().enumerate() {
             vocab.insert(w.clone(), i);
         }
-        let (_rows, dim) = read_npy_shape(&npy_path)?;
+        let (rows_on_disk, dim) = read_npy_shape(&npy_path)?;
+        // Validate rows match vocab and payload size
+        if rows_on_disk != ivocab.len() {
+            return Err(PyValueError::new_err(format!(
+                "npy shape mismatch: rows={} != vocab={}",
+                rows_on_disk,
+                ivocab.len()
+            )));
+        }
         // Read npy data into w_in
         let buf = fs::read(&npy_path)
             .map_err(|e| PyValueError::new_err(format!("failed to read {}: {}", npy_path, e)))?;
         let header_len = npy_header_len(&buf)?;
         let data_bytes = &buf[header_len..];
-        let rows = ivocab.len();
+        let rows = rows_on_disk;
         if data_bytes.len() != rows * dim * 4 {
             return Err(PyValueError::new_err("npy size mismatch"));
         }
         let mut w_in = vec![0f32; rows * dim];
         for i in 0..rows {
             let dst = &mut w_in[i * dim..(i + 1) * dim];
-            let src = &data_bytes[i * dim * 4..(i + 1) * dim * 4];
+            let start = i * dim * 4;
+            let end = (i + 1) * dim * 4;
+            if end > data_bytes.len() {
+                return Err(PyValueError::new_err("npy size mismatch"));
+            }
+            let src = &data_bytes[start..end];
             for j in 0..dim {
                 let off = j * 4;
                 dst[j] = f32::from_le_bytes(src[off..off + 4].try_into().unwrap());

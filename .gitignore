@@ -13,3 +13,7 @@ dist/
 *.wordvectors
 *.json
 
+# Local work artifacts
+vibecoding/
+.tmp/
+tmp_kvtest/

@@ -1,6 +1,6 @@
 [package]
 name = "word2vec_matryoshka"
-version = "0.1.0"
+version = "0.1.4"
 edition = "2021"
 description = "Word2Vec with Matryoshka multi-level representations (Rust + PyO3)"
 license = "MIT"

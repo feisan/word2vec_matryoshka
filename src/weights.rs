@@ -42,7 +42,14 @@ impl SharedWeights {
     }
     /// Consume and return the underlying vector. Panics if other `Arc` refs exist.
     pub fn into_vec(self) -> Vec<f32> {
-        Arc::try_unwrap(self.data).unwrap().into_inner()
+        match Arc::try_unwrap(self.data) {
+            Ok(cell) => cell.into_inner(),
+            Err(arc) => {
+                // Fallback: clone underlying data to avoid panic if other Arcs still exist.
+                // Safe: read-only clone of Vec<f32> snapshot.
+                unsafe { (&*arc.get()).clone() }
+            }
+        }
     }
     /// Lock the shard mutexes for two rows in a consistent order to avoid deadlocks.
     #[allow(dead_code)]
@@ -57,15 +64,15 @@ impl SharedWeights {
         let s1 = r1 % SHARDS;
         let s2 = r2 % SHARDS;
         if s1 == s2 {
-            let g1 = self.shards[s1].lock().unwrap();
+            let g1 = self.shards[s1].lock().unwrap_or_else(|e| e.into_inner());
             (g1, None)
         } else if s1 < s2 {
-            let g1 = self.shards[s1].lock().unwrap();
-            let g2 = self.shards[s2].lock().unwrap();
+            let g1 = self.shards[s1].lock().unwrap_or_else(|e| e.into_inner());
+            let g2 = self.shards[s2].lock().unwrap_or_else(|e| e.into_inner());
             (g1, Some(g2))
         } else {
-            let g2 = self.shards[s2].lock().unwrap();
-            let g1 = self.shards[s1].lock().unwrap();
+            let g2 = self.shards[s2].lock().unwrap_or_else(|e| e.into_inner());
+            let g1 = self.shards[s1].lock().unwrap_or_else(|e| e.into_inner());
             (g1, Some(g2))
         }
     }

@@ -181,7 +181,10 @@ pub(crate) fn hs_update_striped(
     lr: f32,
     dim: usize,
 ) {
-    let _g = w_in.shards[center % SHARDS].lock().unwrap();
+    let _g = w_in
+        .shards[center % SHARDS]
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     unsafe {
         // Copy "a" into TLS buffer (no fresh allocation each step)
         let mut a_buf = take_tls_vec1(dim);
@@ -189,7 +192,10 @@ pub(crate) fn hs_update_striped(
         a_buf[..dim].copy_from_slice(&a_src[..dim]);
         let mut neu1e = take_tls_vec2(dim);
         for (bbit, &node) in code.iter().zip(points.iter()) {
-            let _gb = w_out.shards[node % SHARDS].lock().unwrap();
+            let _gb = w_out
+                .shards[node % SHARDS]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let label = if *bbit == 1 { 1.0 } else { 0.0 };
             let b = w_out.row_prefix_mut(node, dim);
             // Score from current b and a_buf
@@ -235,7 +241,7 @@ pub(crate) fn hs_update_cbow_striped(
         if rows.is_empty() {
             continue;
         }
-        let _g = w_in.shards[s].lock().unwrap();
+        let _g = w_in.shards[s].lock().unwrap_or_else(|e| e.into_inner());
         for &idx in rows {
             unsafe {
                 let r = w_in.row_prefix(idx, dim);
@@ -264,7 +270,7 @@ pub(crate) fn hs_update_cbow_striped(
         if rows.is_empty() {
             continue;
         }
-        let _g = w_in.shards[s].lock().unwrap();
+        let _g = w_in.shards[s].lock().unwrap_or_else(|e| e.into_inner());
         for &idx in rows {
             unsafe {
                 let r = w_in.row_prefix_mut(idx, dim);

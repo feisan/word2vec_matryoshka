@@ -183,12 +183,18 @@ pub(crate) fn sgns_update_levels_striped_batched(
     rng: &mut StdRng,
 ) {
     let per = lr / (levels.len() as f32).max(1.0);
-    let _gin = w_in.shards[center % SHARDS].lock().unwrap();
+    let _gin = w_in
+        .shards[center % SHARDS]
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     unsafe {
         let a_row = w_in.row_mut(center);
         // positive
         {
-            let _gout = w_out.shards[context % SHARDS].lock().unwrap();
+            let _gout = w_out
+                .shards[context % SHARDS]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let b_row = w_out.row_mut(context);
             sgns_step_levels_locked_rows(a_row, b_row, 1.0, per, levels, dim_full);
         }
@@ -197,7 +203,10 @@ pub(crate) fn sgns_update_levels_striped_batched(
             if neg == context {
                 neg = (neg + 1) % vocab_size;
             }
-            let _gout = w_out.shards[neg % SHARDS].lock().unwrap();
+            let _gout = w_out
+                .shards[neg % SHARDS]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let b_row = w_out.row_mut(neg);
             sgns_step_levels_locked_rows(a_row, b_row, 0.0, per, levels, dim_full);
         }
@@ -220,12 +229,18 @@ pub(crate) fn sgns_update_levels_alias_striped_batched(
 ) {
     let per = lr / (levels.len() as f32).max(1.0);
     let vocab_size = prob.len();
-    let _gin = w_in.shards[center % SHARDS].lock().unwrap();
+    let _gin = w_in
+        .shards[center % SHARDS]
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     unsafe {
         let a_row = w_in.row_mut(center);
         // positive
         {
-            let _gout = w_out.shards[context % SHARDS].lock().unwrap();
+            let _gout = w_out
+                .shards[context % SHARDS]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let b_row = w_out.row_mut(context);
             sgns_step_levels_locked_rows(a_row, b_row, 1.0, per, levels, dim_full);
         }
@@ -234,7 +249,10 @@ pub(crate) fn sgns_update_levels_alias_striped_batched(
             if neg == context {
                 neg = (neg + 1) % vocab_size;
             }
-            let _gout = w_out.shards[neg % SHARDS].lock().unwrap();
+            let _gout = w_out
+                .shards[neg % SHARDS]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let b_row = w_out.row_mut(neg);
             sgns_step_levels_locked_rows(a_row, b_row, 0.0, per, levels, dim_full);
         }
@@ -315,7 +333,7 @@ pub(crate) fn sgns_update_cbow_striped(
         if rows.is_empty() {
             continue;
         }
-        let _g = w_in.shards[s].lock().unwrap();
+        let _g = w_in.shards[s].lock().unwrap_or_else(|e| e.into_inner());
         for &idx in rows {
             unsafe {
                 let r = w_in.row_prefix(idx, dim);
@@ -348,7 +366,7 @@ pub(crate) fn sgns_update_cbow_striped(
         if rows.is_empty() {
             continue;
         }
-        let _g = w_in.shards[s].lock().unwrap();
+        let _g = w_in.shards[s].lock().unwrap_or_else(|e| e.into_inner());
         for &idx in rows {
             unsafe {
                 let r = w_in.row_prefix_mut(idx, dim);
@@ -383,7 +401,10 @@ pub(crate) fn sgns_update_cbow_alias_striped(
     let c = context_indices.len() as f32;
     let mut h = take_tls_vec1(dim);
     for &idx in context_indices {
-        let _g = w_in.shards[idx % SHARDS].lock().unwrap();
+        let _g = w_in
+            .shards[idx % SHARDS]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             let r = w_in.row_prefix(idx, dim);
             for k in 0..dim {
@@ -407,7 +428,10 @@ pub(crate) fn sgns_update_cbow_alias_striped(
         cbow_step_with_hidden(&h, w_out, neg, 0.0, lr, dim, &mut neu1e);
     }
     for &idx in context_indices {
-        let _g = w_in.shards[idx % SHARDS].lock().unwrap();
+        let _g = w_in
+            .shards[idx % SHARDS]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             let r = w_in.row_prefix_mut(idx, dim);
             for k in 0..dim {
@@ -457,7 +481,10 @@ pub(crate) fn cbow_step_with_hidden(
     dim: usize,
     neu1e: &mut [f32],
 ) {
-    let _g = w_out.shards[target % SHARDS].lock().unwrap();
+    let _g = w_out
+        .shards[target % SHARDS]
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     unsafe {
         let b = w_out.row_prefix_mut(target, dim);
         // First pass: compute score directly from current values

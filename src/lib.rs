@@ -222,7 +222,11 @@ impl Word2Vec {
             let src = &data_bytes[start..end];
             for j in 0..dim {
                 let off = j * 4;
-                dst[j] = f32::from_le_bytes(src[off..off + 4].try_into().unwrap());
+                let bytes = &src[off..off + 4];
+                let arr: [u8; 4] = bytes
+                    .try_into()
+                    .map_err(|_| PyValueError::new_err("npy size mismatch"))?;
+                dst[j] = f32::from_le_bytes(arr);
             }
         }
         let w_out = vec![0.0f32; rows * dim];
@@ -365,11 +369,17 @@ impl Word2Vec {
 
         let use_parallel = self._workers > 1;
         let interrupt = Arc::new(AtomicBool::new(false));
-        // Prepare sentences (read-only)
-        let sents_idx = sentences_to_indices(&corpus_iterable, &self.vocab)?;
+        // Prepare sentences (read-only) only when total_examples is not provided
+        let (_sents_idx_opt, total_per_epoch): (Option<Vec<Vec<usize>>>, usize) =
+            if let Some(te) = total_examples {
+                (None, te)
+            } else {
+                let sents_idx = sentences_to_indices(&corpus_iterable, &self.vocab)?;
+                let total: usize = sents_idx.iter().map(|s| s.len()).sum();
+                (Some(sents_idx), total)
+            };
         // Keep an owned handle to the Python iterable for multi-epoch/branch reuse
         let sentences_owned = corpus_iterable.unbind();
-        let total_per_epoch: usize = sents_idx.iter().map(|s| s.len()).sum();
         if verbose.unwrap_or(self.log_verbose) {
             let sg_num = if self.sg { 1 } else { 0 };
             let hs_num = if self.hs { 1 } else { 0 };
@@ -633,6 +643,9 @@ impl Word2Vec {
                 // Clone a new Py<PyAny> handle for the producer thread
                 let sentences_obj = Python::with_gil(|py| sentences_owned.clone_ref(py));
                 let vocab = self.vocab.clone();
+                // Stop flag to allow the producer to cease early when the epoch completes
+                let producer_stop = Arc::new(AtomicBool::new(false));
+                let producer_stop_for_thread = producer_stop.clone();
                 std::thread::spawn(move || {
                     // Larger batch size amortizes GIL and channel overhead
                     let chunk_cap: usize = std::env::var("W2V_CHUNK")
@@ -650,11 +663,18 @@ impl Word2Vec {
                     if let Some(iter_obj) = iter_handle {
                         let mut chunk: Vec<Vec<usize>> = Vec::with_capacity(chunk_cap);
                         loop {
+                            if producer_stop_for_thread.load(Ordering::Relaxed) {
+                                break;
+                            }
                             let mut ended = false;
                             // Pull up to CHUNK items under the GIL, then release to let other threads (e.g., logger) run
                             Python::with_gil(|py| {
                                 let it = iter_obj.bind(py);
                                 for _ in 0..chunk_cap {
+                                    if producer_stop_for_thread.load(Ordering::Relaxed) {
+                                        ended = true;
+                                        break;
+                                    }
                                     match it.call_method0("__next__") {
                                         Ok(item) => {
                                             if let Ok(seq) = item.extract::<Vec<String>>() {
@@ -700,7 +720,7 @@ impl Word2Vec {
                         let recv_res = py.allow_threads(|| {
                             rx_clone
                                 .lock()
-                                .unwrap()
+                                .unwrap_or_else(|e| e.into_inner())
                                 .recv_timeout(Duration::from_millis(200))
                         });
                         let chunk = match recv_res {
@@ -913,6 +933,8 @@ impl Word2Vec {
                 if let Some(flag) = &stop_flag_opt {
                     flag.store(true, Ordering::Relaxed);
                 }
+                // Signal producer to stop as epoch has completed
+                producer_stop.store(true, Ordering::Relaxed);
                 if let Some(rep) = reporter_opt {
                     let _ = rep.join();
                 }
@@ -1500,7 +1522,9 @@ impl Word2Vec {
 }
 
 fn random_unit(dim: usize) -> Vec<f32> {
-    let mut rng = GLOBAL_RNG.lock().unwrap();
+    let mut rng = GLOBAL_RNG
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let mut v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>()).collect();
     // normalize
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();

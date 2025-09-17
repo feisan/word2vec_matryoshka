@@ -121,10 +121,14 @@ unsafe fn accumulate_levels_x86(
         i += 8;
     }
 
-    // Horizontal sum
+    // Horizontal sum for the SIMD-processed block
     let dot_sum = _mm256_reduce_add_ps(vdot);
     let na_sum = _mm256_reduce_add_ps(vna);
     let nb_sum = _mm256_reduce_add_ps(vnb);
+    // Accumulate SIMD block contributions into the running heads
+    *head_dot += dot_sum;
+    *head_na += na_sum;
+    *head_nb += nb_sum;
 
     // Add remaining elements
     while i < end {
@@ -163,10 +167,14 @@ unsafe fn accumulate_levels_aarch64(
         i += 4;
     }
 
-    // Horizontal sum
+    // Horizontal sum for the SIMD-processed block
     let dot_sum = vaddvq_f32(vdot);
     let na_sum = vaddvq_f32(vna);
     let nb_sum = vaddvq_f32(vnb);
+    // Accumulate SIMD block contributions into the running heads
+    *head_dot += dot_sum;
+    *head_na += na_sum;
+    *head_nb += nb_sum;
 
     // Add remaining elements
     while i < end {

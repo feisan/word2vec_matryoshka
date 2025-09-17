@@ -4,7 +4,7 @@ use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyModule, PySlice};
 
-use crate::io::npy::{npy_header_len, read_npy_shape, write_npy};
+use crate::io::npy::{read_npy_shape, write_npy};
 
 #[pyclass(module = "word2vec_matryoshka")]
 #[derive(Default)]
@@ -57,14 +57,23 @@ impl KeyedVectors {
             )));
         }
 
-        if mmap == Some("r") {
+        if mmap == Some("r") || mmap == Some("r+") {
             let memmap = Python::with_gil(|py| -> PyResult<Py<PyAny>> {
                 let np = PyModule::import_bound(py, "numpy")?;
                 let kwargs = PyDict::new_bound(py);
+                // Treat both 'r' and 'r+' as read-only mmap for safety
                 kwargs.set_item("mmap_mode", "r")?;
                 let arr = np
                     .getattr("load")?
                     .call((npy_path.as_str(),), Some(&kwargs))?;
+                // Validate C-contiguous layout to match row-major pointer math later
+                let flags = arr.getattr("flags")?;
+                let c_contig: bool = flags.getattr("c_contiguous")?.extract()?;
+                if !c_contig {
+                    return Err(PyValueError::new_err(
+                        "array must be C-contiguous for memmap similarity",
+                    ));
+                }
                 Ok(arr.into_py(py))
             })?;
             Ok(Self {
@@ -77,7 +86,7 @@ impl KeyedVectors {
             })
         } else {
             // Robust path: use numpy to load the array fully, then copy into Rust vectors
-            let (rows, vectors): (usize, HashMap<String, Vec<f32>>) = Python::with_gil(|py| {
+            let (_rows, vectors): (usize, HashMap<String, Vec<f32>>) = Python::with_gil(|py| {
                 let np = PyModule::import_bound(py, "numpy")?;
                 let arr_obj = np.getattr("load")?.call1((npy_path.as_str(),))?;
                 let arr: Bound<PyArray2<f32>> = arr_obj.downcast_into()?;
@@ -130,7 +139,9 @@ impl KeyedVectors {
             // Atomic temp files
             let vocab_tmp = format!("{}.tmp", &vocab_path);
             let npy_tmp = format!("{}.tmp", &npy_path);
-            std::fs::write(&vocab_tmp, serde_json::to_string(&words).unwrap()).map_err(|e| {
+            let vocab_json = serde_json::to_string(&words)
+                .map_err(|e| PyValueError::new_err(format!("failed to encode vocab: {}", e)))?;
+            std::fs::write(&vocab_tmp, vocab_json).map_err(|e| {
                 PyValueError::new_err(format!("failed to write {}: {}", vocab_tmp, e))
             })?;
             let mut flat: Vec<f32> = Vec::with_capacity(words.len() * cols);
@@ -155,9 +166,10 @@ impl KeyedVectors {
             // Atomic temp files
             let vocab_tmp = format!("{}.tmp", &vocab_path);
             let npy_tmp = format!("{}.tmp", &npy_path);
-            std::fs::write(&vocab_tmp, serde_json::to_string(&self.vocab).unwrap()).map_err(
-                |e| PyValueError::new_err(format!("failed to write {}: {}", vocab_tmp, e)),
-            )?;
+            let vocab_json = serde_json::to_string(&self.vocab)
+                .map_err(|e| PyValueError::new_err(format!("failed to encode vocab: {}", e)))?;
+            std::fs::write(&vocab_tmp, vocab_json)
+                .map_err(|e| PyValueError::new_err(format!("failed to write {}: {}", vocab_tmp, e)))?;
             std::fs::copy(src, &npy_tmp)
                 .map_err(|e| PyValueError::new_err(format!("failed to copy npy: {}", e)))?;
             std::fs::rename(&vocab_tmp, &vocab_path).map_err(|e| {
@@ -228,7 +240,7 @@ impl KeyedVectors {
                     } else if let Some(pos) = heap
                         .iter()
                         .enumerate()
-                        .min_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap())
+                        .min_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap_or(std::cmp::Ordering::Equal))
                         .map(|p| p.0)
                     {
                         if sim > heap[pos].1 {
@@ -239,7 +251,7 @@ impl KeyedVectors {
                 heap
             });
             let mut heap = heap;
-            heap.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            heap.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             return Ok(heap);
         }
         // Memmap-backed path: copy each row prefix into Rust slices and compute on the fly
@@ -299,7 +311,7 @@ impl KeyedVectors {
                 } else if let Some(pos) = heap
                     .iter()
                     .enumerate()
-                    .min_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap())
+                    .min_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap_or(std::cmp::Ordering::Equal))
                     .map(|p| p.0)
                 {
                     if sim > heap[pos].1 {
@@ -311,7 +323,7 @@ impl KeyedVectors {
         });
         // Sort and map to tokens under the GIL again
         let mut heap = heap;
-        heap.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        heap.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         Ok(heap
             .into_iter()
             .map(|(i, s)| (self.vocab[i].clone(), s))
@@ -366,6 +378,14 @@ impl KeyedVectors {
         if let Some(map) = &self.vectors {
             let rows = self.vocab.len();
             let cols = self.vector_size;
+            // Validate vocab->map completeness to avoid panic on expect()
+            for w in &self.vocab {
+                if !map.contains_key(w) {
+                    return Err(PyValueError::new_err(
+                        "vocab and vectors out of sync",
+                    ));
+                }
+            }
             // Build the flat buffer without the GIL
             let flat: Vec<f32> = py.allow_threads(|| {
                 let mut flat = Vec::with_capacity(rows * cols);

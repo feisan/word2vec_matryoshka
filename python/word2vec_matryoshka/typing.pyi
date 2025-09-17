@@ -51,6 +51,9 @@ class Word2Vec:
         corpus_iterable: Iterable[Sequence[str]],
         total_examples: int | None = ...,
         epochs: int | None = ...,
+        progress: object | None = ...,
+        verbose: bool | None = ...,
+        progress_interval: float | None = ...,
     ) -> None: ...
     @property
     def wv(self) -> KeyedVectors: ...

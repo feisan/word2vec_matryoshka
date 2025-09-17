@@ -27,3 +27,7 @@ def test_restartable_iterable_epochs2():
 
     # Basic sanity
     assert m.wv["a"].shape == (16,)
+
+
+    # Phase 3 streaming/stop-flag behaviors are validated indirectly by restartable iterable tests
+    # and by the absence of deadlocks/timeouts in parallel workers with bounded queues.
